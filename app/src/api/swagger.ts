@@ -34,11 +34,11 @@ const swaggerDefinition: OpenAPIV3.Document = {
     schemas: {
       ChatCompletionRequest: {
         type: 'object',
-        required: ['model', 'messages'],
+        required: ['messages'],
         properties: {
           model: {
             type: 'string',
-            description: 'Model identifier',
+            description: 'Model identifier (optional if session_id refers to a session with a stored default model)',
             example: 'claude-3-5-sonnet-20241022'
           },
           messages: {
@@ -70,6 +70,30 @@ const swaggerDefinition: OpenAPIV3.Document = {
             type: 'string',
             description: 'Session ID for conversation continuity',
             example: 'my-conversation-session'
+          },
+          effort: {
+            type: 'string',
+            description: 'Effort level for the current session',
+            example: 'medium',
+            enum: ['low', 'medium', 'high', 'xhigh', 'max']
+          },
+          permission_mode: {
+            type: 'string',
+            description: 'Permission mode to use for the session',
+            example: 'auto',
+            enum: ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan']
+          },
+          'permission-mode': {
+            type: 'string',
+            description: 'Alias for permission_mode to support alternate client field naming',
+            example: 'auto',
+            enum: ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan']
+          },
+          permissionMode: {
+            type: 'string',
+            description: 'Alias for permission_mode to support alternate client field naming',
+            example: 'auto',
+            enum: ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan']
           },
           tools: {
             type: 'array',
@@ -274,6 +298,21 @@ const swaggerDefinition: OpenAPIV3.Document = {
           }
         }
       },
+      StringListResponse: {
+        type: 'object',
+        properties: {
+          object: {
+            type: 'string',
+            enum: ['list']
+          },
+          data: {
+            type: 'array',
+            items: {
+              type: 'string'
+            }
+          }
+        }
+      },
       Model: {
         type: 'object',
         properties: {
@@ -320,6 +359,18 @@ const swaggerDefinition: OpenAPIV3.Document = {
             type: 'string',
             format: 'date-time',
             description: 'Session expiration timestamp'
+          },
+          model: {
+            type: 'string',
+            description: 'Optional model stored on this session'
+          },
+          effort: {
+            type: 'string',
+            description: 'Optional effort level stored on this session'
+          },
+          permission_mode: {
+            type: 'string',
+            description: 'Optional permission mode stored on this session'
           }
         }
       },
@@ -515,6 +566,44 @@ const swaggerDefinition: OpenAPIV3.Document = {
               'application/json': {
                 schema: {
                   $ref: '#/components/schemas/ModelsResponse'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    '/v1/efforts': {
+      get: {
+        tags: ['Models'],
+        summary: 'List available effort levels',
+        description: 'Get the effort levels accepted by the Claude CLI --effort flag',
+        responses: {
+          '200': {
+            description: 'List of available effort levels',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/StringListResponse'
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    '/v1/permission-modes': {
+      get: {
+        tags: ['Models'],
+        summary: 'List available permission modes',
+        description: 'Get the permission modes accepted by the Claude CLI --permission-mode flag',
+        responses: {
+          '200': {
+            description: 'List of available permission modes',
+            content: {
+              'application/json': {
+                schema: {
+                  $ref: '#/components/schemas/StringListResponse'
                 }
               }
             }

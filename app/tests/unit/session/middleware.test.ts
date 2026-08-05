@@ -14,7 +14,8 @@ import '../../mocks/logger.mock';
 jest.mock('../../../src/session/manager', () => ({
   sessionManager: {
     processMessages: jest.fn(),
-    addAssistantResponse: jest.fn()
+    addAssistantResponse: jest.fn(),
+    getSession: jest.fn()
   }
 }));
 
@@ -95,7 +96,11 @@ describe('Session Middleware', () => {
 
       sessionMiddleware(mockReq as SessionRequest, mockRes as Response, mockNext);
 
-      expect(mockSessionManager.processMessages).toHaveBeenCalledWith(originalMessages, testSessionId);
+      expect(mockSessionManager.processMessages).toHaveBeenCalledWith(
+        originalMessages,
+        testSessionId,
+        { model: 'gpt-4' }
+      );
       expect(mockReq.sessionData).toEqual({
         isSessionRequest: true,
         sessionId: testSessionId,
@@ -160,7 +165,7 @@ describe('Session Middleware', () => {
 
       sessionMiddleware(mockReq as SessionRequest, mockRes as Response, mockNext);
 
-      expect(mockSessionManager.processMessages).toHaveBeenCalledWith([], 'test-session');
+      expect(mockSessionManager.processMessages).toHaveBeenCalledWith([], 'test-session', { model: 'gpt-4' });
       expect(mockNext).toHaveBeenCalledWith();
     });
 

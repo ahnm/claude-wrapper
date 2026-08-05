@@ -88,7 +88,10 @@ export class StreamingManager implements IStreamingManager {
         this.connectionTimeouts.delete(id);
       }
       
-      if (connection.response && !connection.response.headersSent) {
+      // Guard on whether the response is already finished, not on headersSent:
+      // a streaming response always has its headers sent, so the old check
+      // meant the response was never actually ended.
+      if (connection.response && !connection.response.writableEnded) {
         try {
           connection.response.end();
         } catch (error) {

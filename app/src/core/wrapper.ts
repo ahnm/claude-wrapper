@@ -137,7 +137,7 @@ export class CoreWrapper implements ICoreWrapper {
     
     // Stage 1: Setup system prompt session
     const systemPrompts = this.extractSystemPrompts(request.messages);
-    const sessionId = await this.createSystemPromptSession(systemPrompts);
+    const sessionId = await this.createSystemPromptSession(systemPrompts, request.model);
     
     // Store the session mapping
     const systemPromptContent = systemPrompts.map(msg => msg.content).join('\n\n');
@@ -157,10 +157,10 @@ export class CoreWrapper implements ICoreWrapper {
     return this.processWithSession(request, sessionId);
   }
 
-  private async createSystemPromptSession(systemPrompts: OpenAIMessage[]): Promise<string> {
+  private async createSystemPromptSession(systemPrompts: OpenAIMessage[], model: string = 'sonnet'): Promise<string> {
     const systemContent = systemPrompts.map(msg => msg.content).join('\n\n');
     const setupRequest: ClaudeRequest = {
-      model: 'sonnet',
+      model,
       messages: [{ role: 'system' as const, content: systemContent }]
     };
     
@@ -234,7 +234,8 @@ export class CoreWrapper implements ICoreWrapper {
       return {
         model: request.model,
         messages: request.messages,
-        ...(request.tools && { tools: request.tools })
+        ...(request.tools && { tools: request.tools }),
+        ...this.claudeInvocationOptions(request)
       };
     }
 
@@ -257,7 +258,20 @@ export class CoreWrapper implements ICoreWrapper {
     return {
       model: request.model,
       messages: enhancedMessages,
-      ...(request.tools && { tools: request.tools })
+      ...(request.tools && { tools: request.tools }),
+      ...this.claudeInvocationOptions(request)
+    };
+  }
+
+  /**
+   * Carry effort/permission mode from the incoming request through to the
+   * Claude CLI invocation, preserving whichever spelling the client used.
+   */
+  private claudeInvocationOptions(request: OpenAIRequest): Partial<ClaudeRequest> {
+    return {
+      ...(request.effort !== undefined && { effort: request.effort }),
+      ...(request.permission_mode !== undefined && { permission_mode: request.permission_mode }),
+      ...(request.permissionMode !== undefined && { permissionMode: request.permissionMode })
     };
   }
 

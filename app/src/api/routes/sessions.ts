@@ -7,6 +7,7 @@
 import { Router, Request, Response } from 'express';
 import { sessionManager } from '../../session/manager';
 import { asyncHandler } from '../middleware/error';
+import { normalizePermissionMode } from '../../utils/permission-mode';
 import { logger } from '../../utils/logger';
 
 const router = Router();
@@ -135,11 +136,16 @@ router.delete('/v1/sessions/:sessionId', asyncHandler(async (req: Request, res: 
  */
 router.post('/v1/sessions/:sessionId/messages', asyncHandler(async (req: Request, res: Response): Promise<Response> => {
   const { sessionId } = req.params;
-  const { messages } = req.body;
-  
-  logger.info('Add messages to session request received', { 
+  const body = req.body || {};
+  const { messages, model, effort } = body;
+  const permissionMode = normalizePermissionMode(body);
+
+  logger.info('Add messages to session request received', {
     sessionId,
-    messageCount: messages?.length 
+    messageCount: messages?.length,
+    model,
+    effort,
+    permission_mode: permissionMode
   });
 
   if (!messages || !Array.isArray(messages)) {
@@ -186,17 +192,29 @@ router.post('/v1/sessions/:sessionId/messages', asyncHandler(async (req: Request
   }
 
   sessionManager.getOrCreateSession(sessionId);
-  const [allMessages] = sessionManager.processMessages(messages, sessionId);
-  
-  logger.info('Messages added to session successfully', { 
+  const [allMessages] = sessionManager.processMessages(messages, sessionId, {
+    ...(model !== undefined && { model }),
+    ...(effort !== undefined && { effort }),
+    ...(permissionMode !== undefined && { permission_mode: permissionMode })
+  });
+
+  const sessionInfo = sessionManager.getSession(sessionId);
+
+  logger.info('Messages added to session successfully', {
     sessionId,
-    totalMessages: allMessages.length
+    totalMessages: allMessages.length,
+    model: sessionInfo?.model,
+    effort: sessionInfo?.effort,
+    permission_mode: sessionInfo?.permission_mode
   });
 
   return res.json({
     session_id: sessionId,
     message_count: allMessages.length,
-    messages: allMessages
+    messages: allMessages,
+    ...(sessionInfo?.model !== undefined && { model: sessionInfo.model }),
+    ...(sessionInfo?.effort !== undefined && { effort: sessionInfo.effort }),
+    ...(sessionInfo?.permission_mode !== undefined && { permission_mode: sessionInfo.permission_mode })
   });
 }));
 

@@ -5,10 +5,12 @@
 
 // Create the mock BEFORE any imports
 const mockExecAsync = jest.fn();
+const mockSpawn = jest.fn();
 
 // Mock child_process
 jest.mock('child_process', () => ({
-  exec: jest.fn()
+  exec: jest.fn(),
+  spawn: (...args: any[]) => mockSpawn(...args)
 }));
 
 // Mock util with our specific mock function
@@ -16,8 +18,48 @@ jest.mock('util', () => ({
   promisify: jest.fn(() => mockExecAsync)
 }));
 
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
 import { ClaudeResolver } from '../../../src/core/claude-resolver';
 import { ClaudeCliError, TimeoutError } from '../../../src/utils/errors';
+
+/**
+ * Build a stand-in for the ChildProcess returned by spawn().
+ * Prompts are delivered over stdin, so the double must be writable.
+ */
+function createMockChild(options: {
+  stdout?: string;
+  stderr?: string;
+  code?: number | null;
+  signal?: string | null;
+  error?: Error;
+} = {}): any {
+  const child: any = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new PassThrough();
+
+  setImmediate(() => {
+    if (options.error) {
+      child.emit('error', options.error);
+      return;
+    }
+
+    if (options.stdout) {
+      child.stdout.write(options.stdout);
+    }
+    if (options.stderr) {
+      child.stderr.write(options.stderr);
+    }
+
+    child.stdout.end();
+    child.stderr.end();
+
+    setImmediate(() => child.emit('close', options.code ?? 0, options.signal ?? null));
+  });
+
+  return child;
+}
 
 // Mock logger
 jest.mock('../../../src/utils/logger', () => ({
@@ -120,14 +162,75 @@ describe('ClaudeResolver', () => {
         // Setup resolver with found command first
         mockExecAsync
           .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude', stderr: '' })
-          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' })
-          .mockResolvedValueOnce({ stdout: 'Claude response', stderr: '' });
+          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' });
+        mockSpawn.mockReturnValueOnce(createMockChild({ stdout: 'Claude response' }));
 
         const resolver = new ClaudeResolver();
         await resolver.findClaudeCommand(); // Cache the command
         const result = await resolver.executeClaudeCommand('test prompt', 'sonnet');
-        
+
         expect(result).toBe('Claude response');
+
+        // Binary and flags are passed as argv, not through a shell
+        const [command, args, options] = mockSpawn.mock.calls[0];
+        expect(command).toBe('/usr/local/bin/claude');
+        expect(args).toEqual(['--print', '--model', 'sonnet']);
+        expect(options.shell).toBe(false);
+        expect(options.windowsHide).toBe(true);
+      });
+
+      it('should pass effort and permission mode flags when provided', async () => {
+        mockExecAsync
+          .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude', stderr: '' })
+          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' });
+        mockSpawn.mockReturnValueOnce(createMockChild({ stdout: 'Claude response' }));
+
+        const resolver = new ClaudeResolver();
+        await resolver.findClaudeCommand();
+        await resolver.executeClaudeCommandWithSession(
+          'test prompt',
+          'sonnet',
+          'session-123',
+          false,
+          'high',
+          'acceptEdits'
+        );
+
+        expect(mockSpawn.mock.calls[0][1]).toEqual([
+          '--print', '--model', 'sonnet',
+          '--resume', 'session-123',
+          '--effort', 'high',
+          '--permission-mode', 'acceptEdits'
+        ]);
+      });
+
+      it('should normalize fable model aliases', async () => {
+        mockExecAsync
+          .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude', stderr: '' })
+          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' });
+        mockSpawn.mockReturnValueOnce(createMockChild({ stdout: 'Claude response' }));
+
+        const resolver = new ClaudeResolver();
+        await resolver.findClaudeCommand();
+        await resolver.executeClaudeCommand('test prompt', 'claude-fable-5');
+
+        expect(mockSpawn.mock.calls[0][1]).toEqual(['--print', '--model', 'fable']);
+      });
+
+      it('should write the prompt to stdin rather than escaping it into a shell command', async () => {
+        mockExecAsync
+          .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude', stderr: '' })
+          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' });
+
+        const child = createMockChild({ stdout: 'Claude response' });
+        mockSpawn.mockReturnValueOnce(child);
+
+        const prompt = `it's a "quoted" prompt; rm -rf /`;
+        const resolver = new ClaudeResolver();
+        await resolver.findClaudeCommand();
+        await resolver.executeClaudeCommand(prompt, 'sonnet');
+
+        expect(child.stdin.read().toString()).toBe(prompt);
       });
     });
 
@@ -136,8 +239,8 @@ describe('ClaudeResolver', () => {
         // Setup resolver with found command first
         mockExecAsync
           .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude', stderr: '' })
-          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' })
-          .mockRejectedValueOnce(new Error('timeout exceeded'));
+          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' });
+        mockSpawn.mockReturnValueOnce(createMockChild({ error: new Error('timeout exceeded') }));
 
         const resolver = new ClaudeResolver();
         await resolver.findClaudeCommand(); // Cache the command
@@ -149,11 +252,23 @@ describe('ClaudeResolver', () => {
         // Setup resolver with found command first
         mockExecAsync
           .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude', stderr: '' })
-          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' })
-          .mockRejectedValueOnce(new Error('Permission denied'));
+          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' });
+        mockSpawn.mockReturnValueOnce(createMockChild({ error: new Error('Permission denied') }));
 
         const resolver = new ClaudeResolver();
         await resolver.findClaudeCommand(); // Cache the command
+        await expect(resolver.executeClaudeCommand('test prompt', 'sonnet'))
+          .rejects.toThrow(ClaudeCliError);
+      });
+
+      it('should throw ClaudeCliError on a non-zero exit code', async () => {
+        mockExecAsync
+          .mockResolvedValueOnce({ stdout: '/usr/local/bin/claude', stderr: '' })
+          .mockResolvedValueOnce({ stdout: 'Claude CLI v1.0.0', stderr: '' });
+        mockSpawn.mockReturnValueOnce(createMockChild({ stderr: 'boom', code: 1 }));
+
+        const resolver = new ClaudeResolver();
+        await resolver.findClaudeCommand();
         await expect(resolver.executeClaudeCommand('test prompt', 'sonnet'))
           .rejects.toThrow(ClaudeCliError);
       });

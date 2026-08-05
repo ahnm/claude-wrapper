@@ -80,20 +80,38 @@ export class StreamingHandler implements IStreamingHandler {
         }
       }
 
-      // Close connection
-      this.manager.closeConnection(requestId);
-      
       const totalTime = Date.now() - startTime;
-      logger.info('Streaming response completed', { 
-        requestId, 
-        totalTime: `${totalTime}ms` 
+      logger.info('Streaming response completed', {
+        requestId,
+        totalTime: `${totalTime}ms`
       });
 
     } catch (error) {
       logger.error('Streaming request failed', error instanceof Error ? error : new Error(String(error)), { requestId });
-      
-      // Send error and cleanup
-      response.write(this.formatter.formatError(error instanceof Error ? error : new Error(String(error))));
+
+      // Best effort: the client may already be gone
+      try {
+        response.write(this.formatter.formatError(error instanceof Error ? error : new Error(String(error))));
+      } catch (writeError) {
+        logger.warn('Unable to write error chunk to response', {
+          requestId,
+          error: writeError instanceof Error ? writeError.message : String(writeError)
+        });
+      }
+    } finally {
+      // End the response on every path, including errors and early breaks,
+      // so the client is never left waiting on an open stream.
+      if (response && !response.writableEnded) {
+        try {
+          response.end();
+        } catch (error) {
+          logger.warn('Error ending streaming response', {
+            requestId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+
       this.manager.closeConnection(requestId);
     }
   }
@@ -119,7 +137,10 @@ export class StreamingHandler implements IStreamingHandler {
         ...(request.tools && { tools: request.tools }),
         ...(request.temperature && { temperature: request.temperature }),
         ...(request.max_tokens && { max_tokens: request.max_tokens }),
-        ...(request.session_id && { session_id: request.session_id })
+        ...(request.session_id && { session_id: request.session_id }),
+        ...(request.effort && { effort: request.effort }),
+        ...(request.permission_mode && { permission_mode: request.permission_mode }),
+        ...(request.permissionMode && { permissionMode: request.permissionMode })
       };
       
       const fullResponse = await this.coreWrapper.handleChatCompletion(nonStreamingRequest);

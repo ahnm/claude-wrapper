@@ -22,6 +22,12 @@ export interface OpenAIRequest {
   temperature?: number;
   max_tokens?: number;
   session_id?: string;
+  effort?: string;
+  // Accepted spellings for the Claude CLI --permission-mode flag. Clients send
+  // any of the three; they are normalized to permission_mode before use.
+  permission_mode?: string;
+  permissionMode?: string;
+  'permission-mode'?: string;
   tools?: any[];
 }
 
@@ -56,6 +62,10 @@ export interface ValidationResult {
 export interface ClaudeRequest {
   model: string;
   messages: OpenAIMessage[];
+  effort?: string;
+  permission_mode?: string;
+  permissionMode?: string;
+  'permission-mode'?: string;
   tools?: any[];
 }
 
@@ -68,7 +78,14 @@ export interface IClaudeClient {
 export interface IClaudeResolver {
   findClaudeCommand(): Promise<string>;
   executeClaudeCommand(prompt: string, model: string): Promise<string>;
-  executeClaudeCommandWithSession(prompt: string, model: string, sessionId: string | null, useJsonOutput: boolean): Promise<string>;
+  executeClaudeCommandWithSession(
+    prompt: string,
+    model: string,
+    sessionId: string | null,
+    useJsonOutput: boolean,
+    effort?: string,
+    permissionMode?: string
+  ): Promise<string>;
 }
 
 export interface IResponseValidator {
@@ -102,6 +119,19 @@ export interface SessionInfo {
   created_at: Date;
   last_accessed: Date;
   expires_at: Date;
+  model?: string;
+  effort?: string;
+  permission_mode?: string;
+}
+
+/**
+ * Claude invocation settings remembered on a session so subsequent requests
+ * can omit them and still resume with the same model/effort/permission mode.
+ */
+export interface SessionMetadata {
+  model?: string;
+  effort?: string;
+  permission_mode?: string;
 }
 
 export interface SessionStorage {
@@ -115,7 +145,11 @@ export interface SessionStorage {
 
 export interface ISessionManager {
   getOrCreateSession(sessionId: string): SessionInfo;
-  processMessages(messages: OpenAIMessage[], sessionId?: string | null): [OpenAIMessage[], string | null];
+  processMessages(
+    messages: OpenAIMessage[],
+    sessionId?: string | null,
+    metadata?: SessionMetadata
+  ): [OpenAIMessage[], string | null];
   listSessions(): SessionInfo[];
   deleteSession(sessionId: string): void;
   getSessionCount(): number;

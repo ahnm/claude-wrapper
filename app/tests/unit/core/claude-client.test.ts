@@ -38,7 +38,9 @@ describe('ClaudeClient', () => {
         expect.stringContaining('Hello, how are you?'),
         'claude-3-5-sonnet-20241022',
         null,
-        false
+        false,
+        undefined,
+        undefined
       );
     });
 

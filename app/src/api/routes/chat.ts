@@ -5,27 +5,44 @@ import { OpenAIRequest } from '../../types';
 import { InvalidRequestError } from '../../utils/errors';
 import { asyncHandler } from '../middleware/error';
 import { streamingMiddleware } from '../middleware/streaming';
+import { sessionProcessingMiddleware } from '../middleware/session';
+import { normalizePermissionMode } from '../../utils/permission-mode';
 import { logger } from '../../utils/logger';
 
 const router = Router();
 const coreWrapper = new CoreWrapper();
 const streamingHandler = new StreamingHandler();
 
-// Apply streaming middleware to chat completions
-router.post('/v1/chat/completions', 
+// Apply session and streaming middleware to chat completions
+router.post('/v1/chat/completions',
+  sessionProcessingMiddleware,
   streamingMiddleware,
   asyncHandler(async (req: Request, res: Response) => {
     logger.info('Chat completion request received', {
       model: req.body.model,
+      sessionId: req.body.session_id,
+      effort: req.body.effort,
+      permissionMode: normalizePermissionMode(req.body),
       messageCount: req.body.messages?.length,
       isStreaming: req.body.stream
     });
 
     const request: OpenAIRequest = req.body;
-    
+
+    // Collapse the accepted permission mode spellings to permission_mode
+    const permissionMode = normalizePermissionMode(request);
+    if (permissionMode !== undefined) {
+      request.permission_mode = permissionMode;
+    }
+
     // Validate required fields
-    if (!request.model || !request.messages || !Array.isArray(request.messages)) {
-      throw new InvalidRequestError('Invalid request format: model and messages are required');
+    if (!request.messages || !Array.isArray(request.messages)) {
+      throw new InvalidRequestError('Invalid request format: messages are required');
+    }
+
+    // A session remembers its model, so model is only required without one
+    if (!request.model && !request.session_id) {
+      throw new InvalidRequestError('Invalid request format: model is required when no session_id is provided');
     }
 
     if (request.messages.length === 0) {

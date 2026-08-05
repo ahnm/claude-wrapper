@@ -65,15 +65,42 @@ describe('API Integration Tests', () => {
             object: 'model', 
             owned_by: 'anthropic' 
           }),
-          expect.objectContaining({ 
-            id: 'opus', 
-            object: 'model', 
-            owned_by: 'anthropic' 
+          expect.objectContaining({
+            id: 'opus',
+            object: 'model',
+            owned_by: 'anthropic'
+          }),
+          expect.objectContaining({
+            id: 'fable',
+            object: 'model',
+            owned_by: 'anthropic'
           })
         ])
       });
       expect(response.body.data).toBeInstanceOf(Array);
       expect(response.body.data.length).toBeGreaterThan(0);
+    });
+
+    it('should return available effort levels', async () => {
+      const response = await request(app)
+        .get('/v1/efforts')
+        .expect(200);
+
+      expect(response.body).toEqual({
+        object: 'list',
+        data: ['low', 'medium', 'high', 'xhigh', 'max']
+      });
+    });
+
+    it('should return available permission modes', async () => {
+      const response = await request(app)
+        .get('/v1/permission-modes')
+        .expect(200);
+
+      expect(response.body.object).toBe('list');
+      expect(response.body.data).toEqual(
+        expect.arrayContaining(['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'])
+      );
     });
   });
 
@@ -110,7 +137,7 @@ describe('API Integration Tests', () => {
       expect(mockHandleChatCompletion).toHaveBeenCalledWith(requestBody);
     });
 
-    it('should reject request with missing model', async () => {
+    it('should reject request with missing model and no session', async () => {
       const requestBody = {
         messages: [{ role: 'user', content: 'Hello' }]
       };
@@ -122,11 +149,38 @@ describe('API Integration Tests', () => {
 
       expect(response.body).toEqual({
         error: {
-          message: 'Invalid request format: model and messages are required',
+          message: 'Invalid request format: model is required when no session_id is provided',
           type: 'api_error',
           code: 'INVALID_REQUEST'
         }
       });
+    });
+
+    it('should accept request with missing model when a session_id is provided', async () => {
+      const mockResponse = {
+        id: 'chatcmpl-session',
+        object: 'chat.completion',
+        created: 1234567890,
+        model: 'claude-3-5-sonnet-20241022',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: 'Hello!' },
+          finish_reason: 'stop'
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
+      };
+
+      mockHandleChatCompletion.mockResolvedValue(mockResponse);
+
+      const response = await request(app)
+        .post('/v1/chat/completions')
+        .send({
+          messages: [{ role: 'user', content: 'Hello' }],
+          session_id: 'existing-session'
+        })
+        .expect(200);
+
+      expect(response.body).toEqual(mockResponse);
     });
 
     it('should reject request with missing messages', async () => {
@@ -141,7 +195,7 @@ describe('API Integration Tests', () => {
 
       expect(response.body).toEqual({
         error: {
-          message: 'Invalid request format: model and messages are required',
+          message: 'Invalid request format: messages are required',
           type: 'api_error',
           code: 'INVALID_REQUEST'
         }

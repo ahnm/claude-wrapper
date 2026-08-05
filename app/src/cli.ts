@@ -184,6 +184,8 @@ class CliRunner {
         console.log(`\n📡 API Endpoints:`);
         console.log(`   POST   http://localhost:${port}/v1/chat/completions      - Main chat API`);
         console.log(`   GET    http://localhost:${port}/v1/models                - List available models`);
+        console.log(`   GET    http://localhost:${port}/v1/efforts               - List available effort levels`);
+        console.log(`   GET    http://localhost:${port}/v1/permission-modes      - List available permission modes`);
         console.log(`   GET    http://localhost:${port}/v1/sessions              - List active sessions`);
         console.log(`   GET    http://localhost:${port}/v1/sessions/stats        - Session statistics`);
         console.log(`   GET    http://localhost:${port}/v1/sessions/:id          - Get session details`);
@@ -255,6 +257,8 @@ class CliRunner {
     console.log(`\n📡 API Endpoints:`);
     console.log(`   POST   http://localhost:${port}/v1/chat/completions      - Main chat API`);
     console.log(`   GET    http://localhost:${port}/v1/models                - List available models`);
+    console.log(`   GET    http://localhost:${port}/v1/efforts               - List available effort levels`);
+    console.log(`   GET    http://localhost:${port}/v1/permission-modes      - List available permission modes`);
     console.log(`   GET    http://localhost:${port}/v1/sessions              - List active sessions`);
     console.log(`   GET    http://localhost:${port}/v1/sessions/stats        - Session statistics`);
     console.log(`   GET    http://localhost:${port}/v1/sessions/:id          - Get session details`);

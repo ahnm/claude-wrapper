@@ -291,7 +291,7 @@ describe('Session Routes', () => {
       });
 
       expect(mockSessionManager.getOrCreateSession).toHaveBeenCalledWith(testSessionId);
-      expect(mockSessionManager.processMessages).toHaveBeenCalledWith(inputMessages, testSessionId);
+      expect(mockSessionManager.processMessages).toHaveBeenCalledWith(inputMessages, testSessionId, {});
     });
 
     test('should return 400 when messages are missing', async () => {
@@ -429,7 +429,7 @@ describe('Session Routes', () => {
         .expect(200);
 
       expect(response.body.session_id).toBe(testSessionId);
-      expect(mockSessionManager.processMessages).toHaveBeenCalledWith(validMessages, testSessionId);
+      expect(mockSessionManager.processMessages).toHaveBeenCalledWith(validMessages, testSessionId, {});
     });
 
     test('should handle empty messages array', async () => {

@@ -205,6 +205,34 @@ describe('Session Class', () => {
       expect(session.messages.length).toBe(1);
       expect(sessionInfo.messages.length).toBe(2);
     });
+
+    test('should omit invocation settings that were never set', () => {
+      const sessionInfo = session.toSessionInfo();
+
+      expect(sessionInfo).not.toHaveProperty('model');
+      expect(sessionInfo).not.toHaveProperty('effort');
+      expect(sessionInfo).not.toHaveProperty('permission_mode');
+    });
+  });
+
+  describe('updateMetadata method', () => {
+    test('should store model, effort and permission mode', () => {
+      session.updateMetadata({ model: 'opus', effort: 'high', permission_mode: 'auto' });
+
+      const sessionInfo = session.toSessionInfo();
+
+      expect(sessionInfo.model).toBe('opus');
+      expect(sessionInfo.effort).toBe('high');
+      expect(sessionInfo.permission_mode).toBe('auto');
+    });
+
+    test('should leave stored values untouched when fields are omitted', () => {
+      session.updateMetadata({ model: 'opus', effort: 'high' });
+      session.updateMetadata({ effort: 'low' });
+
+      expect(session.model).toBe('opus');
+      expect(session.effort).toBe('low');
+    });
   });
 });
 
@@ -330,8 +358,32 @@ describe('SessionManager Class', () => {
       // Second request should include history
       const [second] = sessionManager.processMessages(secondMessages, testSessionId);
       expect(second).toEqual([...firstMessages, ...secondMessages]);
-      
+
       expect(sessionManager.getSessionCount()).toBe(1);
+    });
+
+    test('should remember invocation settings passed as metadata', () => {
+      sessionManager.processMessages(createTestMessages(1), testSessionId, {
+        model: 'opus',
+        effort: 'high',
+        permission_mode: 'acceptEdits'
+      });
+
+      const session = sessionManager.getSession(testSessionId);
+
+      expect(session?.model).toBe('opus');
+      expect(session?.effort).toBe('high');
+      expect(session?.permission_mode).toBe('acceptEdits');
+    });
+
+    test('should retain earlier settings when a later request omits them', () => {
+      sessionManager.processMessages(createTestMessages(1), testSessionId, { model: 'opus', effort: 'high' });
+      sessionManager.processMessages(createTestMessages(1), testSessionId, {});
+
+      const session = sessionManager.getSession(testSessionId);
+
+      expect(session?.model).toBe('opus');
+      expect(session?.effort).toBe('high');
     });
   });
 

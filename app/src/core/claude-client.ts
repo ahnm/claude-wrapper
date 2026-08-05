@@ -1,6 +1,7 @@
 import { ClaudeRequest, IClaudeClient } from '../types';
 import { ClaudeResolver } from './claude-resolver';
 import { ClaudeCliError } from '../utils/errors';
+import { normalizePermissionMode } from '../utils/permission-mode';
 import { logger } from '../utils/logger';
 
 export class ClaudeClient implements IClaudeClient {
@@ -17,26 +18,34 @@ export class ClaudeClient implements IClaudeClient {
   async executeWithSession(request: ClaudeRequest, sessionId: string | null, useJsonOutput: boolean): Promise<string> {
     try {
       const prompt = this.messagesToPrompt(request.messages, request.tools);
-      logger.debug('Converting messages to prompt', { 
+      const permissionMode = normalizePermissionMode(request);
+
+      logger.debug('Converting messages to prompt', {
         messageCount: request.messages.length,
         model: request.model,
         hasTools: !!request.tools,
         sessionId,
-        useJsonOutput
+        useJsonOutput,
+        effort: request.effort,
+        permissionMode
       });
-      
+
       const result = await this.resolver.executeClaudeCommandWithSession(
-        prompt, 
-        request.model, 
-        sessionId, 
-        useJsonOutput
+        prompt,
+        request.model,
+        sessionId,
+        useJsonOutput,
+        request.effort,
+        permissionMode
       );
-      
+
       logger.info('Claude execution completed successfully', {
         model: request.model,
         responseLength: result.length,
         sessionId,
-        useJsonOutput
+        useJsonOutput,
+        effort: request.effort,
+        permissionMode
       });
       
       return result;

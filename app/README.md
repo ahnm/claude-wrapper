@@ -106,7 +106,9 @@ wrapper -k my-secure-key           # shorthand
 | Method   | Endpoint                    | Description                                   |
 | -------- | --------------------------- | --------------------------------------------- |
 | `POST`   | `/v1/chat/completions`      | Main chat completions with session support    |
-| `GET`    | `/v1/models`                | List available Claude models (sonnet, opus)   |
+| `GET`    | `/v1/models`                | List available Claude models (sonnet, opus, fable) |
+| `GET`    | `/v1/efforts`               | List available effort levels                  |
+| `GET`    | `/v1/permission-modes`      | List available permission modes               |
 | `GET`    | `/v1/sessions`              | List all active sessions                      |
 | `GET`    | `/v1/sessions/stats`        | Get session statistics                        |
 | `GET`    | `/v1/sessions/:id`          | Get specific session details                  |

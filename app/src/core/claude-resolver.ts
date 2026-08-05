@@ -1,4 +1,4 @@
-import { exec } from 'child_process';
+import { exec, spawn, SpawnOptions } from 'child_process';
 import { promisify } from 'util';
 import { IClaudeResolver } from '../types';
 import { ClaudeCliError, TimeoutError } from '../utils/errors';
@@ -48,7 +48,7 @@ export class ClaudeResolver implements IClaudeResolver {
     for (const pathCmd of pathCommands) {
       try {
         logger.debug('Trying PATH resolution', { command: pathCmd });
-        const { stdout } = await execAsync(pathCmd, { timeout: 2000 });
+        const { stdout } = await execAsync(pathCmd, { timeout: 2000, windowsHide: true });
         const claudePath = stdout.trim();
         
         if (claudePath && !claudePath.includes('not found')) {
@@ -140,58 +140,83 @@ export class ClaudeResolver implements IClaudeResolver {
   }
 
   async executeClaudeCommandWithSession(
-    prompt: string, 
-    model: string, 
-    sessionId: string | null, 
-    useJsonOutput: boolean
+    prompt: string,
+    model: string,
+    sessionId: string | null,
+    useJsonOutput: boolean,
+    effort?: string,
+    permissionMode?: string
   ): Promise<string> {
     const claudeCmd = await this.findClaudeCommand();
     const config = EnvironmentManager.getConfig();
-    
+
     // Build command flags
-    let flags = `--print --model ${model}`;
-    
+    const normalizedModel = this.normalizeModel(model);
+    let flags = `--print --model ${normalizedModel}`;
+
     // Add session flag if provided
     if (sessionId) {
       flags += ` --resume ${sessionId}`;
     }
-    
+
+    // Add effort flag if provided
+    if (effort) {
+      flags += ` --effort ${effort}`;
+    }
+
+    // Add permission mode flag if provided
+    if (permissionMode) {
+      flags += ` --permission-mode ${permissionMode}`;
+    }
+
     // Add JSON output flag if requested
     if (useJsonOutput) {
       flags += ` --output-format json`;
     }
-    
+
+    // The prompt is written to stdin rather than interpolated into a shell
+    // command, so it never needs escaping and cannot break the invocation.
+    let useShell = false;
     let command: string;
-    
+    let args: string[] = [];
+
     // Handle Docker commands
     if (claudeCmd.includes('docker run') || claudeCmd.includes('podman run')) {
       // For Docker, we need to modify the container command
-      const dockerCommand = claudeCmd + ` ${flags}`;
-      command = `echo '${this.escapeShellString(prompt)}' | ${dockerCommand}`;
+      command = `${claudeCmd} ${flags}`;
+      useShell = true;
     }
     // Handle bash -c wrapped commands
     else if (claudeCmd.includes('bash -c')) {
-      command = `echo '${this.escapeShellString(prompt)}' | ${claudeCmd.replace('"claude"', `"claude ${flags}"`)}`;
+      command = claudeCmd.replace('"claude"', `"claude ${flags}"`);
+      useShell = true;
     }
     // Handle regular commands
     else {
-      command = `echo '${this.escapeShellString(prompt)}' | ${claudeCmd} ${flags}`;
+      command = claudeCmd;
+      args = flags.split(' ');
+      useShell = false;
     }
 
-    logger.debug('Executing Claude command with session', { 
-      model, 
-      promptLength: prompt.length, 
+    logger.debug('Executing Claude command with session', {
+      model,
+      promptLength: prompt.length,
       sessionId,
       useJsonOutput,
-      isDocker: claudeCmd.includes('docker') || claudeCmd.includes('podman')
+      isDocker: claudeCmd.includes('docker') || claudeCmd.includes('podman'),
+      useShell,
+      command,
+      args
     });
-    
+
     try {
-      const { stdout, stderr } = await execAsync(command, { 
+      const { stdout, stderr } = await this.execWithInput(command, args, prompt, {
         maxBuffer: 1024 * 1024 * 10,
-        timeout: config.timeout
+        timeout: config.timeout,
+        shell: useShell,
+        windowsHide: true
       });
-      
+
       if (stderr && stderr.trim()) {
         logger.warn('Claude CLI warning', { stderr: stderr.trim() });
       }
@@ -210,10 +235,79 @@ export class ClaudeResolver implements IClaudeResolver {
     }
   }
 
+  /**
+   * Spawn the Claude CLI and feed the prompt over stdin.
+   * Avoids `echo '<prompt>' | claude`, which breaks on Windows (no POSIX shell)
+   * and requires escaping arbitrary user content into a shell command line.
+   */
+  private async execWithInput(
+    command: string,
+    args: string[],
+    input: string,
+    options: {
+      maxBuffer?: number;
+      timeout?: number;
+      shell?: boolean;
+      windowsHide?: boolean;
+    }
+  ): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const spawnOptions: SpawnOptions = {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: options.shell || false,
+        ...(options.timeout !== undefined && { timeout: options.timeout }),
+        windowsHide: options.windowsHide === true
+      };
+
+      const child = args.length > 0 && !spawnOptions.shell
+        ? spawn(command, args, spawnOptions)
+        : spawn(command, spawnOptions);
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+      child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+
+      child.on('error', (error: Error) => reject(error));
+
+      child.on('close', (code, signal) => {
+        if (code === 0) {
+          resolve({ stdout, stderr });
+          return;
+        }
+
+        const exitMessage = code === null
+          ? `Command exited due to signal ${signal}`
+          : `Command exited with code ${code}${signal ? ` signal ${signal}` : ''}`;
+
+        reject(new Error(`${exitMessage}\n${stderr}`));
+      });
+
+      if (child.stdin && child.stdin.writable) {
+        child.stdin.write(input);
+        child.stdin.end();
+      }
+    });
+  }
+
+  /**
+   * Map OpenAI-style model aliases onto the names the Claude CLI accepts.
+   */
+  private normalizeModel(model: string): string {
+    const normalized = String(model).toLowerCase();
+
+    if (normalized === 'fable-5' || normalized === 'claude-fable-5') {
+      return 'fable';
+    }
+
+    return model;
+  }
+
   private async testClaudeCommand(command: string): Promise<boolean> {
     try {
       const testCmd = `${command} --version`;
-      const { stdout, stderr } = await execAsync(testCmd, { timeout: 3000 });
+      const { stdout, stderr } = await execAsync(testCmd, { timeout: 3000, windowsHide: true });
       const output = (stdout + stderr).toLowerCase();
       
       // Check for Claude CLI indicators
@@ -227,9 +321,5 @@ export class ClaudeResolver implements IClaudeResolver {
       });
       return false;
     }
-  }
-
-  private escapeShellString(str: string): string {
-    return str.replace(/'/g, "'\"'\"'");
   }
 }

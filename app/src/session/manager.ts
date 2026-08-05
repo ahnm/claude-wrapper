@@ -4,7 +4,7 @@
  * Follows SRP and DRY principles with interfaces for testability
  */
 
-import { OpenAIMessage, SessionInfo, ISessionManager, ISessionCleanup, SessionStats } from '../types';
+import { OpenAIMessage, SessionInfo, ISessionManager, ISessionCleanup, SessionStats, SessionMetadata } from '../types';
 import { MemorySessionStorage, SessionUtils } from './storage';
 import { SESSION_CONFIG } from '../config/constants';
 import { logger } from '../utils/logger';
@@ -19,6 +19,9 @@ export class Session {
   created_at: Date;
   last_accessed: Date;
   expires_at: Date;
+  model?: string;
+  effort?: string;
+  permission_mode?: string;
 
   constructor(session_id: string) {
     this.session_id = session_id;
@@ -45,6 +48,24 @@ export class Session {
     this.touch();
   }
 
+  /**
+   * Remember the Claude invocation settings for this session so later requests
+   * can omit them. Only defined values overwrite what is already stored.
+   */
+  updateMetadata(metadata: SessionMetadata): void {
+    if (metadata.model !== undefined) {
+      this.model = metadata.model;
+    }
+
+    if (metadata.effort !== undefined) {
+      this.effort = metadata.effort;
+    }
+
+    if (metadata.permission_mode !== undefined) {
+      this.permission_mode = metadata.permission_mode;
+    }
+  }
+
   getAllMessages(): OpenAIMessage[] {
     return [...this.messages];
   }
@@ -59,7 +80,10 @@ export class Session {
       messages: [...this.messages],
       created_at: this.created_at,
       last_accessed: this.last_accessed,
-      expires_at: this.expires_at
+      expires_at: this.expires_at,
+      ...(this.model !== undefined && { model: this.model }),
+      ...(this.effort !== undefined && { effort: this.effort }),
+      ...(this.permission_mode !== undefined && { permission_mode: this.permission_mode })
     };
   }
 }
@@ -170,7 +194,11 @@ export class SessionManager implements ISessionManager, ISessionCleanup {
     });
   }
 
-  processMessages(messages: OpenAIMessage[], sessionId?: string | null): [OpenAIMessage[], string | null] {
+  processMessages(
+    messages: OpenAIMessage[],
+    sessionId?: string | null,
+    metadata: SessionMetadata = {}
+  ): [OpenAIMessage[], string | null] {
     if (sessionId === null || sessionId === undefined) {
       // Stateless mode - return messages as-is
       return [messages, null];
@@ -179,7 +207,10 @@ export class SessionManager implements ISessionManager, ISessionCleanup {
     // Get or create session
     this.getOrCreateSession(sessionId);
     const session = this.sessions.get(sessionId)!;
-    
+
+    // Remember model/effort/permission mode for subsequent requests
+    session.updateMetadata(metadata);
+
     // For new messages, add them to the session and return ALL messages (history + new)
     session.addMessages(messages);
     const allMessages = session.getAllMessages();

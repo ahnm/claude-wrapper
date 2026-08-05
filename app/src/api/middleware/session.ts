@@ -6,7 +6,8 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { sessionManager } from '../../session/manager';
-import { OpenAIRequest } from '../../types';
+import { OpenAIRequest, SessionMetadata } from '../../types';
+import { normalizePermissionMode } from '../../utils/permission-mode';
 import { logger } from '../../utils/logger';
 
 /**
@@ -47,8 +48,21 @@ export function sessionMiddleware(
     if (isSessionRequest) {
       // Process messages with session continuity
       const originalMessages = request.messages || [];
-      const [allMessages, actualSessionId] = sessionManager.processMessages(originalMessages, sessionId);
-      
+
+      // Remember any invocation settings supplied on this request
+      const permissionMode = normalizePermissionMode(request);
+      const metadataUpdates: SessionMetadata = {
+        ...(request.model !== undefined && { model: request.model }),
+        ...(request.effort !== undefined && { effort: request.effort }),
+        ...(permissionMode !== undefined && { permission_mode: permissionMode })
+      };
+
+      const [allMessages, actualSessionId] = sessionManager.processMessages(
+        originalMessages,
+        sessionId,
+        metadataUpdates
+      );
+
       // Store session data in request for later use
       req.sessionData = {
         isSessionRequest: true,
@@ -56,14 +70,32 @@ export function sessionMiddleware(
         originalMessages,
         allMessages
       };
-      
+
       // Update request body with session-aware messages
       req.body.messages = allMessages;
-      
+
+      // Backfill settings the client omitted from what the session remembers
+      const sessionInfo = actualSessionId ? sessionManager.getSession(actualSessionId) : null;
+
+      if (!request.model && sessionInfo?.model) {
+        req.body.model = sessionInfo.model;
+      }
+
+      if (request.effort === undefined && sessionInfo?.effort) {
+        req.body.effort = sessionInfo.effort;
+      }
+
+      if (permissionMode === undefined && sessionInfo?.permission_mode) {
+        req.body.permission_mode = sessionInfo.permission_mode;
+      }
+
       logger.info('Session-aware request processed', {
         sessionId: actualSessionId,
         originalMessageCount: originalMessages.length,
-        totalMessageCount: allMessages.length
+        totalMessageCount: allMessages.length,
+        model: req.body.model,
+        effort: req.body.effort,
+        permission_mode: req.body.permission_mode
       });
     } else {
       // Stateless request - no session processing
