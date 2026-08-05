@@ -155,7 +155,11 @@ wrapper -s                         # shorthand
 
 ## 📚 Documentation
 
-📖 **[Full Documentation](docs/README.md)** - Comprehensive guide with detailed examples, production deployment, troubleshooting, and advanced configuration.
+📖 **[Full Documentation](../docs/README.md)** - Comprehensive guide with detailed examples, production deployment, troubleshooting, and advanced configuration.
+
+## 🔌 Integrations
+
+🖥️ **[Open WebUI](../docs/integrations/openwebui.md)** - Pipe function giving Open WebUI per-chat session continuity plus effort and permission-mode control. Ready to paste: [`openwebui-pipe.py`](../docs/integrations/openwebui-pipe.py).
 
 ## 📄 License
 
