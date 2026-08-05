@@ -1,15 +1,26 @@
 import { Router, Request, Response } from 'express';
 import { asyncHandler } from '../middleware/error';
 import { CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES } from '../../utils/permission-mode';
+import { buildModelVariants } from '../../utils/model-spec';
 import { logger } from '../../utils/logger';
 
 const router = Router();
 
 // Working Claude models
+const BASE_MODEL_IDS = ['sonnet', 'opus', 'fable'];
+
+const toModel = (id: string) => ({
+  id,
+  object: 'model',
+  owned_by: 'anthropic',
+  created: 1709164800
+});
+
+// Base models first, then the model:effort variants a model dropdown can use
+// to drive effort on clients that cannot send a top-level effort field.
 const CLAUDE_MODELS = [
-  { id: 'sonnet', object: 'model', owned_by: 'anthropic', created: 1709164800 },
-  { id: 'opus', object: 'model', owned_by: 'anthropic', created: 1709164800 },
-  { id: 'fable', object: 'model', owned_by: 'anthropic', created: 1709164800 }
+  ...BASE_MODEL_IDS.map(toModel),
+  ...buildModelVariants(BASE_MODEL_IDS).map(toModel)
 ];
 
 router.get('/v1/models', asyncHandler(async (_req: Request, res: Response) => {

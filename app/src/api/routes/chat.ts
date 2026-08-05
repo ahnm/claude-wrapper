@@ -6,6 +6,7 @@ import { InvalidRequestError } from '../../utils/errors';
 import { asyncHandler } from '../middleware/error';
 import { streamingMiddleware } from '../middleware/streaming';
 import { sessionProcessingMiddleware } from '../middleware/session';
+import { modelSpecMiddleware } from '../middleware/model-spec';
 import { normalizePermissionMode } from '../../utils/permission-mode';
 import { logger } from '../../utils/logger';
 
@@ -13,8 +14,9 @@ const router = Router();
 const coreWrapper = new CoreWrapper();
 const streamingHandler = new StreamingHandler();
 
-// Apply session and streaming middleware to chat completions
+// Decode the model spec first so sessions store the decoded values
 router.post('/v1/chat/completions',
+  modelSpecMiddleware,
   sessionProcessingMiddleware,
   streamingMiddleware,
   asyncHandler(async (req: Request, res: Response) => {
