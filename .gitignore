@@ -79,3 +79,6 @@ test.sh
 
 # Yarn Integrity file
 .yarn-integrity
+# Python
+__pycache__/
+*.py[cod]
