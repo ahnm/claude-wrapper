@@ -10,10 +10,11 @@ import {
 import { ClaudeClient } from './claude-client';
 import { ResponseValidator } from './validator';
 import { logger } from '../utils/logger';
-import { 
-  API_CONSTANTS, 
-  TEMPLATE_CONSTANTS, 
-  DEFAULT_USAGE 
+import {
+  API_CONSTANTS,
+  TEMPLATE_CONSTANTS,
+  DEFAULT_USAGE,
+  CLAUDE_SESSION_CACHE
 } from '../config/constants';
 import crypto from 'crypto';
 
@@ -43,8 +44,8 @@ export class CoreWrapper implements ICoreWrapper {
     });
 
     // Detect if we have a system prompt and check for existing session
-    const sessionInfo = this.detectSystemPromptSession(request.messages);
-    
+    const sessionInfo = this.detectSystemPromptSession(request.messages, request.session_id);
+
     if (sessionInfo.isNewSession) {
       // Create new Claude session or process normally
       if (sessionInfo.systemPromptHash) {
@@ -55,7 +56,7 @@ export class CoreWrapper implements ICoreWrapper {
     } else {
       // Resume existing Claude session
       if (sessionInfo.claudeSessionId && sessionInfo.sessionState) {
-        return this.processWithSession(request, sessionInfo.claudeSessionId);
+        return this.processWithSession(request, sessionInfo.claudeSessionId, sessionInfo.systemPromptHash);
       } else {
         // Fallback to normal processing if session data is incomplete
         return this.processNormally(request);
@@ -63,7 +64,26 @@ export class CoreWrapper implements ICoreWrapper {
     }
   }
 
-  private detectSystemPromptSession(messages: OpenAIMessage[]): {
+  /**
+   * Key under which a Claude CLI session is cached.
+   *
+   * The system prompt alone is NOT sufficient: every chat from a given client
+   * usually carries the same system prompt, so keying on it alone collapses
+   * unrelated conversations onto one Claude session and each new chat gets
+   * --resume'd into the previous one's history. The client's session_id is what
+   * distinguishes conversations, so it has to be part of the key.
+   */
+  private getClaudeSessionKey(systemPrompts: OpenAIMessage[], sessionId: string | undefined): string | null {
+    if (!sessionId) {
+      // No conversation identity to key on. Reusing a session here would leak
+      // one conversation's history into another, so decline to reuse at all.
+      return null;
+    }
+
+    return `${sessionId}:${this.getSystemPromptHash(systemPrompts)}`;
+  }
+
+  private detectSystemPromptSession(messages: OpenAIMessage[], sessionId?: string): {
     isNewSession: boolean;
     systemPromptHash?: string;
     claudeSessionId?: string;
@@ -71,25 +91,33 @@ export class CoreWrapper implements ICoreWrapper {
   } {
     // Extract system prompts from messages
     const systemPrompts = this.extractSystemPrompts(messages);
-    
+
     if (systemPrompts.length === 0) {
       // No system prompt - no optimization needed
       return { isNewSession: true };
     }
 
-    // Create hash from system prompt content
-    const systemPromptHash = this.getSystemPromptHash(systemPrompts);
-    
-    // Check if we have an existing Claude session for this system prompt
+    // Scope the session to the conversation, not just the system prompt
+    const systemPromptHash = this.getClaudeSessionKey(systemPrompts, sessionId);
+
+    if (!systemPromptHash) {
+      logger.debug('No session_id supplied; skipping Claude session reuse', {
+        systemPromptCount: systemPrompts.length
+      });
+
+      return { isNewSession: true };
+    }
+
+    // Check if we have an existing Claude session for this conversation
     const sessionState = this.claudeSessions.get(systemPromptHash);
-    
+
     if (sessionState) {
-      logger.debug('Found existing Claude session for system prompt', {
+      logger.debug('Found existing Claude session for conversation', {
         systemPromptHash,
         claudeSessionId: sessionState.claudeSessionId,
         lastUsed: sessionState.lastUsed
       });
-      
+
       return {
         isNewSession: false,
         systemPromptHash,
@@ -103,7 +131,7 @@ export class CoreWrapper implements ICoreWrapper {
       systemPromptHash,
       systemPromptCount: systemPrompts.length
     });
-    
+
     return { isNewSession: true, systemPromptHash };
   }
 
@@ -152,9 +180,44 @@ export class CoreWrapper implements ICoreWrapper {
       systemPromptHash,
       claudeSessionId: sessionId
     });
-    
+
+    this.pruneClaudeSessions();
+
     // Stage 2: Process remaining messages with session
-    return this.processWithSession(request, sessionId);
+    return this.processWithSession(request, sessionId, systemPromptHash);
+  }
+
+  /**
+   * Bound the Claude session cache. Keys are per-conversation, so without this
+   * the map grows once per chat for the lifetime of the process. Expired
+   * entries go first, then the least recently used.
+   */
+  private pruneClaudeSessions(): void {
+    const now = Date.now();
+    const maxAgeMs = CLAUDE_SESSION_CACHE.MAX_AGE_HOURS * 60 * 60 * 1000;
+
+    for (const [key, state] of this.claudeSessions.entries()) {
+      if (now - state.lastUsed.getTime() > maxAgeMs) {
+        this.claudeSessions.delete(key);
+      }
+    }
+
+    if (this.claudeSessions.size <= CLAUDE_SESSION_CACHE.MAX_ENTRIES) {
+      return;
+    }
+
+    const byLeastRecentlyUsed = [...this.claudeSessions.entries()]
+      .sort((a, b) => a[1].lastUsed.getTime() - b[1].lastUsed.getTime());
+
+    const excess = this.claudeSessions.size - CLAUDE_SESSION_CACHE.MAX_ENTRIES;
+    for (const [key] of byLeastRecentlyUsed.slice(0, excess)) {
+      this.claudeSessions.delete(key);
+    }
+
+    logger.debug('Pruned Claude session cache', {
+      evicted: excess,
+      remaining: this.claudeSessions.size
+    });
   }
 
   private async createSystemPromptSession(systemPrompts: OpenAIMessage[], model: string = 'sonnet'): Promise<string> {
@@ -174,26 +237,31 @@ export class CoreWrapper implements ICoreWrapper {
     return sessionId;
   }
 
-  private async processWithSession(request: OpenAIRequest, sessionId: string): Promise<OpenAIResponse> {
+  private async processWithSession(
+    request: OpenAIRequest,
+    sessionId: string,
+    sessionKey?: string
+  ): Promise<OpenAIResponse> {
     logger.info('Processing with existing Claude session', { sessionId });
-    
+
     // Strip system prompts and process remaining messages
     const strippedRequest = this.stripSystemPrompts(request);
     const claudeRequest = this.addFormatInstructions(strippedRequest);
-    
+
     const rawResponse = await this.claudeClient.executeWithSession(
-      claudeRequest, 
-      sessionId, 
+      claudeRequest,
+      sessionId,
       false // Regular mode, not JSON
     );
-    
-    // Update session state
-    const sessionHash = this.getSystemPromptHash(this.extractSystemPrompts(request.messages));
-    const sessionState = this.claudeSessions.get(sessionHash);
+
+    // Update session state under the same key it was cached with
+    const key = sessionKey
+      ?? this.getClaudeSessionKey(this.extractSystemPrompts(request.messages), request.session_id);
+    const sessionState = key ? this.claudeSessions.get(key) : undefined;
     if (sessionState) {
       sessionState.lastUsed = new Date();
     }
-    
+
     return this.validateAndCorrect(rawResponse, claudeRequest);
   }
 

@@ -47,6 +47,12 @@ export const DEFAULT_USAGE = {
   TOTAL_TOKENS: 15,
 } as const;
 
+// Claude CLI session cache (keyed per conversation, so it needs bounding)
+export const CLAUDE_SESSION_CACHE = {
+  MAX_ENTRIES: 500,
+  MAX_AGE_HOURS: 4,
+} as const;
+
 // Streaming Configuration Constants (Phase 4A)
 export const STREAMING_CONFIG = {
   CHUNK_TIMEOUT_MS: 100,

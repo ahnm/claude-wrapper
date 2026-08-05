@@ -33,6 +33,7 @@ describe('CoreWrapper', () => {
     it('should process request without system prompt optimization', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'user', content: 'What is 2+2?' }
         ]
@@ -66,6 +67,7 @@ describe('CoreWrapper', () => {
     it('should create new session for system prompt', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a math tutor.' },
           { role: 'user', content: 'What is 5+3?' }
@@ -112,6 +114,7 @@ describe('CoreWrapper', () => {
     it('should throw error if session setup fails', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helper.' },
           { role: 'user', content: 'Hello' }
@@ -126,12 +129,111 @@ describe('CoreWrapper', () => {
     });
   });
 
+  describe('conversation isolation', () => {
+    // Regression: sessions were once keyed on the system prompt alone. Every
+    // chat from a given client carries the same system prompt, so unrelated
+    // conversations collapsed onto one Claude session and each new chat got
+    // resumed into the previous one's history.
+    it('should not reuse a session across different session_ids', async () => {
+      const systemPrompt = 'You are a helpful assistant.';
+
+      const chatA: OpenAIRequest = {
+        model: 'sonnet',
+        session_id: 'chat-a',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: 'First conversation' }
+        ]
+      };
+
+      const chatB: OpenAIRequest = {
+        model: 'sonnet',
+        session_id: 'chat-b',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: 'Second conversation' }
+        ]
+      };
+
+      ClaudeClientMock.setSessionSetupResponse('{"session_id":"session123","result":"Ready"}');
+      ClaudeClientMock.setSessionResponses({ 'session123': 'Session response' });
+      ValidatorMock.setValidationAsValid(false);
+
+      await wrapper.handleChatCompletion(chatA);
+      const callsAfterA = mockClaudeClient.executeWithSession.mock.calls.length;
+
+      await wrapper.handleChatCompletion(chatB);
+      const callsForB = mockClaudeClient.executeWithSession.mock.calls.length - callsAfterA;
+
+      // Chat B must pay for its own setup call rather than resuming chat A's
+      expect(callsForB).toBe(2);
+    });
+
+    it('should not reuse a session when no session_id is supplied', async () => {
+      const systemPrompt = 'You are a helpful assistant.';
+
+      const first: OpenAIRequest = {
+        model: 'sonnet',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: 'First' }
+        ]
+      };
+
+      const second: OpenAIRequest = {
+        model: 'sonnet',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: 'Second' }
+        ]
+      };
+
+      ClaudeClientMock.setSessionSetupResponse('{"session_id":"session123","result":"Ready"}');
+      ClaudeClientMock.setSessionResponses({ 'session123': 'Session response' });
+      ValidatorMock.setValidationAsValid(false);
+
+      await wrapper.handleChatCompletion(first);
+      await wrapper.handleChatCompletion(second);
+
+      // Without a conversation identity there is nothing safe to key on, so
+      // neither request should open or resume a Claude session
+      expect(mockClaudeClient.executeWithSession).not.toHaveBeenCalled();
+    });
+
+    it('should still reuse the session within one conversation', async () => {
+      const systemPrompt = 'You are a helpful assistant.';
+
+      const build = (content: string): OpenAIRequest => ({
+        model: 'sonnet',
+        session_id: 'same-chat',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content }
+        ]
+      });
+
+      ClaudeClientMock.setSessionSetupResponse('{"session_id":"session123","result":"Ready"}');
+      ClaudeClientMock.setSessionResponses({ 'session123': 'Session response' });
+      ValidatorMock.setValidationAsValid(false);
+
+      await wrapper.handleChatCompletion(build('First'));
+      const callsAfterFirst = mockClaudeClient.executeWithSession.mock.calls.length;
+
+      await wrapper.handleChatCompletion(build('Second'));
+      const callsForSecond = mockClaudeClient.executeWithSession.mock.calls.length - callsAfterFirst;
+
+      // Setup already happened, so the follow-up is a single resumed call
+      expect(callsForSecond).toBe(1);
+    });
+  });
+
   describe('processWithSession - session reuse', () => {
     it('should reuse existing session for same system prompt', async () => {
       const systemPrompt = 'You are a math tutor.';
       
       const firstRequest: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: 'What is 5+3?' }
@@ -140,6 +242,7 @@ describe('CoreWrapper', () => {
 
       const secondRequest: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: 'What is 10-4?' }
@@ -175,6 +278,7 @@ describe('CoreWrapper', () => {
     it('should create new session for different system prompt', async () => {
       const firstRequest: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a math tutor.' },
           { role: 'user', content: 'What is 5+3?' }
@@ -183,6 +287,7 @@ describe('CoreWrapper', () => {
 
       const secondRequest: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a creative writer.' },
           { role: 'user', content: 'Write a poem' }
@@ -240,6 +345,7 @@ describe('CoreWrapper', () => {
     it('should wrap non-JSON responses in OpenAI format', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: 'Hello' }]
       };
 
@@ -268,6 +374,7 @@ describe('CoreWrapper', () => {
     it('should return valid JSON responses as-is', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: 'Hello' }]
       };
 
@@ -289,6 +396,7 @@ describe('CoreWrapper', () => {
     it('should add format instructions for requests with tools', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: 'Use this tool' }],
         tools: [{ type: 'function', function: { name: 'test_tool' } }]
       };
@@ -314,6 +422,7 @@ describe('CoreWrapper', () => {
     it('should add format instructions for multi-turn conversations', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'user', content: 'Hello' },
           { role: 'assistant', content: 'Hi' },
@@ -339,6 +448,7 @@ describe('CoreWrapper', () => {
       const longMessage = 'a'.repeat(250); // > 200 characters
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: longMessage }]
       };
 
@@ -359,6 +469,7 @@ describe('CoreWrapper', () => {
     it('should skip format instructions for simple requests', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: 'Hi' }]
       };
 
@@ -381,6 +492,7 @@ describe('CoreWrapper', () => {
       
       const request1: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: 'Hello' }
@@ -389,6 +501,7 @@ describe('CoreWrapper', () => {
 
       const request2: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: 'Hi there' }
@@ -409,6 +522,7 @@ describe('CoreWrapper', () => {
     it('should generate different hash for different system prompts', async () => {
       const request1: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helpful assistant.' },
           { role: 'user', content: 'Hello' }
@@ -417,6 +531,7 @@ describe('CoreWrapper', () => {
 
       const request2: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a creative writer.' },
           { role: 'user', content: 'Hello' }
@@ -450,6 +565,7 @@ describe('CoreWrapper', () => {
     it('should handle multiple system prompts in single request', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helpful assistant.' },
           { role: 'system', content: 'Be concise in your responses.' },
@@ -479,6 +595,7 @@ describe('CoreWrapper', () => {
     it('should handle Claude client execution errors', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: 'Hello' }]
       };
 
@@ -490,6 +607,7 @@ describe('CoreWrapper', () => {
     it('should handle Claude client session execution errors', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helper.' },
           { role: 'user', content: 'Hello' }
@@ -504,6 +622,7 @@ describe('CoreWrapper', () => {
     it('should handle invalid JSON in session setup response', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helper.' },
           { role: 'user', content: 'Hello' }
@@ -520,6 +639,7 @@ describe('CoreWrapper', () => {
     it('should handle empty session setup response', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helper.' },
           { role: 'user', content: 'Hello' }
@@ -544,6 +664,7 @@ describe('CoreWrapper', () => {
     it('should delegate streaming requests to regular completion', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: 'Hello' }],
         stream: true
       };
@@ -569,6 +690,7 @@ describe('CoreWrapper', () => {
       
       const request1: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: 'First message' }
@@ -577,6 +699,7 @@ describe('CoreWrapper', () => {
 
       const request2: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: 'Second message' }
@@ -614,6 +737,7 @@ describe('CoreWrapper', () => {
       
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: 'Help me with equations' }
@@ -643,6 +767,7 @@ describe('CoreWrapper', () => {
     it('should handle empty messages array', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: []
       };
 
@@ -663,6 +788,7 @@ describe('CoreWrapper', () => {
     it('should handle request with only system prompts', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helper.' }
         ]
@@ -688,6 +814,7 @@ describe('CoreWrapper', () => {
     it('should handle mixed role messages correctly', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helper.' },
           { role: 'user', content: 'Hello' },
@@ -732,6 +859,7 @@ describe('CoreWrapper', () => {
     it('should handle request with different model names', async () => {
       const request: OpenAIRequest = {
         model: 'claude-3-5-sonnet-20241022',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helper.' },
           { role: 'user', content: 'Hello' }
@@ -754,6 +882,7 @@ describe('CoreWrapper', () => {
     it('should handle requests with MCP tools', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: 'Get the weather for New York' }],
         tools: [
           {
@@ -838,6 +967,7 @@ describe('CoreWrapper', () => {
     it('should handle tool calls with session optimization', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: 'You are a helpful assistant with access to tools.' },
           { role: 'user', content: 'What is the weather in San Francisco?' }
@@ -939,6 +1069,7 @@ describe('CoreWrapper', () => {
     it('should handle tool result responses', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'user', content: 'What is the weather in Boston?' },
           { 
@@ -1019,6 +1150,7 @@ describe('CoreWrapper', () => {
     it('should handle multiple tool calls in one response', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: 'Get weather for New York and London' }],
         tools: [
           {
@@ -1104,6 +1236,7 @@ describe('CoreWrapper', () => {
     it('should handle complex MCP tool schema', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [{ role: 'user', content: 'Search for files in my project' }],
         tools: [
           {
@@ -1194,6 +1327,7 @@ describe('CoreWrapper', () => {
     it('should handle tool errors gracefully', async () => {
       const request: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'user', content: 'Get weather for InvalidCity' },
           { 
@@ -1252,6 +1386,7 @@ describe('CoreWrapper', () => {
       
       const request1: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: 'What is the weather in Chicago?' }
@@ -1275,6 +1410,7 @@ describe('CoreWrapper', () => {
 
       const request2: OpenAIRequest = {
         model: 'sonnet',
+        session_id: 'test-session',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: 'What about in Miami?' }
