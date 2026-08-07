@@ -188,16 +188,43 @@ export class ClaudeResolver implements IClaudeResolver {
       isDocker: claudeCmd.includes('docker') || claudeCmd.includes('podman')
     });
     
+    let timedOut = false;
     try {
-      // signal: aborting kills the CLI subprocess (client disconnected)
+      // No exec timeout/signal options: on Windows they only kill the cmd.exe
+      // shell and orphan the claude.exe grandchild. Kill the whole tree instead,
+      // for both timeouts and client-disconnect aborts.
       const childPromise = execAsync(command, {
-        maxBuffer: 1024 * 1024 * 10,
-        timeout: config.timeout,
-        ...(signal ? { signal } : {})
+        maxBuffer: 1024 * 1024 * 10
       });
-      childPromise.child.stdin?.write(prompt);
-      childPromise.child.stdin?.end();
-      const { stdout, stderr } = await childPromise;
+      const child = childPromise.child;
+
+      const killTree = (reason: string) => {
+        if (!child.pid) return;
+        logger.warn(`Killing Claude CLI process tree (${reason})`, { pid: child.pid });
+        if (process.platform === 'win32') {
+          exec(`taskkill /PID ${child.pid} /T /F`);
+        } else {
+          child.kill('SIGKILL');
+        }
+      };
+      const timer = setTimeout(() => { timedOut = true; killTree('timeout'); }, config.timeout);
+      const onAbort = () => killTree('client disconnect');
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      child.stdin?.write(prompt);
+      child.stdin?.end();
+
+      let stdout: string;
+      let stderr: string;
+      try {
+        ({ stdout, stderr } = await childPromise);
+      } finally {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onAbort);
+      }
 
       if (stderr && stderr.trim()) {
         logger.warn('Claude CLI warning', { stderr: stderr.trim() });
@@ -215,7 +242,7 @@ export class ClaudeResolver implements IClaudeResolver {
 
       logger.error('Claude CLI execution failed', error as Error);
 
-      if (errorMessage.includes('timeout')) {
+      if (timedOut || errorMessage.includes('timeout')) {
         throw new TimeoutError(`Claude CLI execution timed out after ${config.timeout}ms`);
       }
 
