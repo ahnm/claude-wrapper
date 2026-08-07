@@ -1,0 +1,739 @@
+"""
+title: Venture Council (startup expert panel)
+author: claude-wrapper
+version: 1.0.0
+license: MIT
+description: >-
+  Multi-agent startup pipeline via claude-wrapper: an interviewer builds a
+  Venture Brief on the Four Anchors, a strategist designs a dynamic council
+  (core experts + spawned specialists for your specific idea), the council
+  researches, the strategist synthesizes a business plan with formula-driven
+  financials and a Kill/Pursue Board, and a red team stress-tests it —
+  routing findings back for rework until it survives. You gate the brief and
+  the plan. Checkpoints to the coordinator: 'sessions' / 'resume <id>'.
+requirements: aiohttp
+"""
+
+import asyncio
+import json
+import re
+import uuid
+from typing import Any, Awaitable, Callable, Optional
+
+import aiohttp
+from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# States & markers
+# ---------------------------------------------------------------------------
+
+STATE_INTAKE = "intake"          # interviewing toward the Venture Brief
+STATE_PLAN_REVIEW = "plan_review"  # plan presented, awaiting user gate
+STATE_DONE = "done"              # final package delivered
+
+STATE_MARKER = "<!-- vc:state={state} -->"
+STATE_RE = re.compile(r"<!-- vc:state=(\w+) -->")
+SESSION_MARKER = "<!-- vc:session={session} -->"
+SESSION_RE = re.compile(r"<!-- vc:session=(\w+) -->")
+
+APPROVE_RE = re.compile(
+    r"^\s*(approve[d]?|lgtm|ship it|proceed|go|yes)\s*[.!]*\s*$", re.IGNORECASE
+)
+BOARD_ANSWER_RE = re.compile(r"^\s*board\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
+SHOW_BOARD_RE = re.compile(r"^\s*board\s*$", re.IGNORECASE)
+SHOW_PLAN_RE = re.compile(r"^\s*plan\s*$", re.IGNORECASE)
+SESSIONS_RE = re.compile(r"^\s*sessions\s*$", re.IGNORECASE)
+RESUME_RE = re.compile(r"^\s*resume\s+(\w+)\s*$", re.IGNORECASE)
+
+BRIEF_HEADING = "# 📄 Venture Brief"
+PLAN_HEADING = "# 📊 Business Plan"
+RECORDS_HEADING = "# 📋 Council Records"
+BOARD_HEADING = "## 🎯 Kill/Pursue Board"
+
+CORE_EXPERTS = ["gap-scout", "market-analyst", "tech-feasibility", "marketing-gtm"]
+
+# ---------------------------------------------------------------------------
+# Role prompts
+# ---------------------------------------------------------------------------
+
+INTAKE_SYSTEM = """You are a startup interviewer building a Venture Brief the
+founder will sign off on. Frame everything on the Four Anchors of superior
+business opportunities: (1) solves a significant problem, (2) creates
+significant value / differentiation, (3) robust market with real buyers and a
+revenue model, (4) fit with founder, location, and timing.
+
+From the conversation so far, respond in markdown with exactly:
+## Draft Venture Brief
+- **Idea**: one-two sentences
+- **Anchor 1 — Problem**: who has it, how painful, evidence
+- **Anchor 2 — Value & differentiation**: why this beats alternatives
+- **Anchor 3 — Market & revenue**: who pays, how, rough size
+- **Anchor 4 — Fit**: founder skills, budget, location, timing
+- **Known facts**: what the founder actually stated
+- **Assumptions**: every gap you filled, each line starting with
+  "⚠️ [estimate]" or "⚠️ [guess]" — never present these as facts
+
+## Open Questions
+Up to 4 questions whose answers would most change the brief. If ready, write
+"None — this brief looks ready to approve." Estimates/guesses from the founder
+are fine — record them as assumptions, do not block on precision.
+
+Keep it under ~400 words. Update every turn from the founder's latest input.
+If the conversation contains a previous plan/pivot, treat it as context this
+idea builds on."""
+
+BRIEF_FINALIZE_SYSTEM = """The founder approved the draft. Write the FINAL
+locked Venture Brief from the conversation: the same sections (Idea, four
+Anchors, Known facts, Assumptions with ⚠️ labels). No questions, no
+commentary. Under ~400 words."""
+
+ROSTER_SYSTEM = """You are the lead strategist designing an expert council for
+this venture. A core panel already exists: gap-scout, market-analyst,
+tech-feasibility, marketing-gtm. Decide which ADDITIONAL specialists this
+specific idea needs — only where a generic panel would miss something that
+could kill or make the business (e.g. healthcare-regulatory, payer
+reimbursement, fintech compliance, marketplace liquidity, hardware supply
+chain, data privacy, App Store policy). Spawn at most {max_specialists};
+zero is a fine answer for simple ideas.
+
+Output ONLY JSON, no prose:
+{{"specialists": [{{"id": "snake_case", "title": "short title",
+  "why": "one sentence on the risk it covers",
+  "charter": "full system prompt for this specialist: its expertise, exactly
+   what to analyze for this venture, and the concrete outputs it must produce
+   (numbers, tables, risks, kill-conditions)"}}]}}"""
+
+GAP_SCOUT_SYSTEM = """You are a market-gap scout. Given a Venture Brief,
+identify: the sharpest underserved gap this idea can own, positioning against
+the status quo, evidence for Anchor 1 (significant problem) and Anchor 2
+(significant value), and the strongest argument that NO real gap exists.
+Be concrete and cite reasoning; label speculation as such."""
+
+MARKET_ANALYST_SYSTEM = """You are a market analyst using the LeanB2B market
+evaluation factors. Given a Venture Brief, produce:
+
+1. A table scoring the CRITICAL factors 1-10 with one-line justification each:
+   compelling reason to buy, budget availability, ease of reach, whole-product
+   readiness, competition intensity (10 = favorable), market leadership
+   potential.
+2. The relevant SITUATIONAL factors: market size & growth, founder industry
+   experience, time to product-market fit, time to cashflow, founder
+   motivation.
+3. Competitor landscape: table of main competitors/alternatives (including
+   "do nothing"), their strength, and this venture's wedge.
+4. A QUALITATIVE verdict paragraph. Do NOT sum the scores into a total —
+   stacking numbers gives the appearance of certainty, not objectivity.
+Label every market number ⚠️ [estimate] — you have no live data."""
+
+TECH_SYSTEM = """You are a pragmatic technical co-founder assessing
+feasibility. Given a Venture Brief, produce: MVP architecture (components,
+stack, what to build vs buy — with a build-vs-buy call on each risky
+component); estimated build time in weeks for the stated founder/team;
+monthly infra cost at three usage tiers (early / traction / scale); the
+top technical risks and the cheapest way to de-risk each. Numbers are
+⚠️ [estimate]s — say so."""
+
+MARKETING_SYSTEM = """You are a growth/GTM strategist. Given a Venture Brief,
+produce: the ideal customer profile; a per-channel table (paid social, search
+ads, SEO/content, organic social, outbound, partnerships — as applicable)
+with estimated CAC, effort, and time-to-results per channel; a recommended
+first-90-days budget split using the founder's stated budget; a
+content/social motion sketch; and the single channel you would bet on first
+and why. Per-channel CAC estimates are ⚠️ [estimate]s — never a single
+blended guess."""
+
+SYNTHESIS_SYSTEM = """You are the lead strategist. Synthesize the Venture
+Brief and every expert report into ONE business plan in markdown with EXACTLY
+these sections:
+
+## Business Model Canvas
+(value prop, segments, channels, relationships, revenue streams, key
+resources/activities/partners, cost structure — tight bullets)
+
+## Go-To-Market
+(from the marketing report: ICP, channel plan with per-channel CAC, 90-day
+budget split)
+
+## MVP & Roadmap
+(from the tech report: MVP scope, then phases with rough durations:
+build → first revenue → PMF signals → scale trigger; state estimated
+time-to-first-revenue and time-to-cashflow-positive)
+
+## Financials
+- **Model inputs** table: every input (price, conversion %, churn, per-channel
+  CAC, build cost, monthly burn lines...) labeled [fact]/[estimate]/[guess]
+- **Formulas** stated explicitly (e.g. ARR = customers × ACV; LTV = ACV ×
+  gross margin / churn; runway = budget / net monthly burn)
+- **Three scenarios** (conservative / base / optimistic) table: customers,
+  ARR by year 1-3, CAC, LTV, LTV:CAC, CAC payback months
+- **Costs & burn**: one-time startup costs table, monthly burn table, and
+  runway in months per scenario — state plainly which month cash runs out
+- **Valuation range** with the comparable logic used
+
+## Anchor Scorecard
+One verdict line per Anchor (✅ / ⚠️ / ❌ + one sentence), citing which
+Kill/Pursue question it hinges on where relevant.
+
+## 🎯 Kill/Pursue Board
+Table, riskiest first (impact-if-wrong × uncertainty):
+| # | Question (founder must answer in the real world) | Hits | If YES | If NO | Cheapest way to find out |
+Mark explicit kill-conditions with 🔴 in the If-YES/If-NO cell they land in.
+Every branch must exist in the plan as a labeled contingency. The board is
+transparent, never blocking — the plan proceeds on best-guess branches.
+
+## Assumption Register
+Every number/claim in the plan labeled [fact]/[estimate]/[guess] with source.
+
+## Decision Log
+Running list of decisions, pivots, and board questions answered so far (carry
+forward and append; start it if absent).
+
+Stay within the brief. Address prior red-team findings explicitly if given."""
+
+SKEPTIC_SYSTEM = """You are a brutal startup skeptic reviewing a business
+plan against its Venture Brief. Attack: the Four Anchors (is the problem
+real, the value differentiated, the market robust, the fit honest), unit
+economics tripwires (LTV:CAC ≥ 3, CAC payback < 12-18 months, sane gross
+margin for the business type, runway reaching the next fundable milestone),
+internal consistency (do the financial formulas and inputs actually produce
+the stated numbers), and the Kill/Pursue Board (is any kill-question silently
+treated as answered? is anything missing from it?).
+
+Numbered findings with severity [critical/major/minor], citing sections.
+FINAL line exactly: `VERDICT: FUND` or `VERDICT: REVISE`."""
+
+INVESTOR_SYSTEM = """You are a seed-stage investor deciding whether this plan
+is fundable. Judge: market size honesty, wedge and defensibility, founder-
+market fit, whether the three scenarios bracket reality, valuation
+reasonableness, the biggest un-de-risked assumption, and whether the
+Kill/Pursue Board covers what diligence would ask. Numbered findings with
+severity. FINAL line exactly: `VERDICT: FUND` or `VERDICT: REVISE`."""
+
+TRIAGE_SYSTEM = """You are the lead strategist triaging red-team findings.
+Decide which experts must re-run with these findings, and whether a NEW
+specialist must be spawned for expertise the council lacks (at most
+{max_specialists} total specialists).
+
+Output ONLY JSON:
+{{"rerun": ["expert-id", ...],
+  "spawn": [{{"id": "snake_case", "title": "...", "why": "...",
+             "charter": "full system prompt as before"}}],
+  "notes": "one-line plan for the revision"}}
+Use only these existing ids: {expert_ids}. rerun/spawn may be empty if the
+findings are fixable by revising the plan alone."""
+
+RESYNTH_SYSTEM = SYNTHESIS_SYSTEM + """
+
+You are REVISING an existing plan. Address every finding explicitly: change
+the plan or rebut with justification (add a '## Findings Addressed' section
+at the end, before nothing else follows it). Append to the Decision Log."""
+
+FINAL_SYSTEM = """You are the lead strategist producing the final founder
+package from the approved plan. Output markdown:
+
+# 🚀 Investor One-Pager
+(problem, solution, market, traction plan, business model, ask — tight)
+
+# ✅ Validation Sprint (next 2 weeks)
+Ordered by risk (from the Kill/Pursue Board): for each experiment — method,
+cost, time, and a PRE-COMMITTED decision rule ("if X then branch A, else B").
+
+# 📒 Decision Log
+Carried forward, complete.
+
+Then repeat the full approved plan unchanged under a divider."""
+
+
+class Pipe:
+    class Valves(BaseModel):
+        CLAUDE_BASE_URL: str = Field(
+            default="http://host.docker.internal:8000/v1",
+            description="claude-wrapper OpenAI-compatible base URL (all agents). Use http://localhost:8000/v1 outside Docker.",
+        )
+        CLAUDE_API_KEY: str = Field(default="", description="API key if the wrapper has auth enabled.")
+        INTERVIEW_MODEL: str = Field(default="sonnet", description="Intake interviewer model.")
+        EXPERT_MODEL: str = Field(default="sonnet", description="Core experts + spawned specialists model.")
+        STRATEGIST_MODEL: str = Field(default="opus", description="Roster design, synthesis, triage, final package.")
+        REDTEAM_MODEL: str = Field(default="opus", description="Skeptic + investor stress-test personas.")
+        MAX_SPECIALISTS: int = Field(default=3, description="Cap on spawned specialists per venture.")
+        MAX_STRESS_ROUNDS: int = Field(default=3, description="Stress-test/rework loop cap.")
+        PARALLEL_EXPERTS: bool = Field(
+            default=False,
+            description="Run the expert sweep concurrently. Only enable if your wrapper handles parallel sessions.",
+        )
+        COORDINATOR_URL: str = Field(
+            default="http://host.docker.internal:8787",
+            description="Coordinator for session checkpoints (sessions / resume <id>). Optional but recommended.",
+        )
+        COORDINATOR_TOKEN: str = Field(default="", description="Coordinator auth token if set.")
+        SHOW_INTERMEDIATE: bool = Field(
+            default=True, description="Expert reports and stress rounds as collapsible sections."
+        )
+        HISTORY_CHAR_BUDGET: int = Field(default=60000, description="Max history characters passed to models.")
+        REQUEST_TIMEOUT: int = Field(default=600, description="Per-request timeout in seconds.")
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    def pipes(self):
+        return [{"id": "venture-council", "name": "Venture Council (startup panel)"}]
+
+    # -- HTTP ---------------------------------------------------------------
+
+    async def _chat(self, session, model: str, system: str, user: str) -> str:
+        v = self.valves
+        headers = {"Content-Type": "application/json"}
+        if v.CLAUDE_API_KEY:
+            headers["Authorization"] = f"Bearer {v.CLAUDE_API_KEY}"
+        async with session.post(
+            f"{v.CLAUDE_BASE_URL.rstrip('/')}/chat/completions",
+            json={"model": model, "stream": False, "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]},
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=v.REQUEST_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"{model} @ {v.CLAUDE_BASE_URL} -> {resp.status}: {(await resp.text())[:500]}"
+                )
+            text = (await resp.json())["choices"][0]["message"]["content"]
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    async def _coord(self, session, method: str, path: str, payload=None):
+        v = self.valves
+        headers = {"Content-Type": "application/json"}
+        if v.COORDINATOR_TOKEN:
+            headers["X-Auth-Token"] = v.COORDINATOR_TOKEN
+        async with session.request(
+            method, v.COORDINATOR_URL.rstrip("/") + path, json=payload,
+            headers=headers, timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            if resp.status == 204:
+                return None
+            if resp.status >= 400:
+                raise RuntimeError(f"coordinator {method} {path} -> {resp.status}")
+            return await resp.json()
+
+    # -- conversation/state helpers ------------------------------------------
+
+    @staticmethod
+    def _content_str(content) -> str:
+        if isinstance(content, list):
+            return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+        return content or ""
+
+    def _scan_marker(self, messages, regex) -> Optional[str]:
+        for m in reversed(messages):
+            if m.get("role") == "assistant":
+                found = regex.findall(self._content_str(m.get("content")))
+                if found:
+                    return found[-1]
+        return None
+
+    def _last_user(self, messages) -> str:
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                return self._content_str(m.get("content"))
+        return ""
+
+    def _history(self, messages) -> str:
+        parts = [
+            f"{m['role'].upper()}: {self._content_str(m.get('content'))}"
+            for m in messages
+            if m.get("role") != "system" and self._content_str(m.get("content"))
+        ]
+        out, budget = [], self.valves.HISTORY_CHAR_BUDGET
+        for p in reversed(parts):
+            if budget - len(p) < 0:
+                out.append("[earlier conversation truncated]")
+                break
+            out.append(p)
+            budget -= len(p)
+        return "\n\n".join(reversed(out))
+
+    @staticmethod
+    def _extract_json(text: str) -> dict:
+        blocks = re.findall(r"```json\s*\n(.*?)```", text, re.DOTALL)
+        return json.loads(blocks[-1] if blocks else text)
+
+    @staticmethod
+    def _verdict_fund(text: str) -> bool:
+        matches = re.findall(r"VERDICT:\s*(\w+)", text, re.IGNORECASE)
+        return bool(matches) and matches[-1].upper() == "FUND"
+
+    @staticmethod
+    def _collapsible(title: str, content: str) -> str:
+        return f"<details>\n<summary>{title}</summary>\n\n{content}\n\n</details>\n"
+
+    @staticmethod
+    def _footer(state: str, text: str, extra: str = "") -> str:
+        return f"\n\n---\n> {text}\n{STATE_MARKER.format(state=state)}{extra}"
+
+    @staticmethod
+    def _name_from(text: str) -> str:
+        first = next((ln for ln in text.strip().splitlines() if ln.strip()), "venture")
+        return re.sub(r"[#*`\-\s]+", " ", first).strip()[:60] or "venture"
+
+    GATE_TEXT = (
+        "🚦 Reply **approve** for the final package · feedback → rework loop · "
+        "**board: <answer>** to answer a Kill/Pursue question (branches collapse, numbers recompute) · "
+        "**board** / **plan** to re-show."
+    )
+    INTAKE_TEXT = (
+        "💬 Answer, correct any assumption, or add facts (guesses are fine — they're labeled). "
+        "Reply **approve** to convene the council."
+    )
+
+    # -- checkpoints ----------------------------------------------------------
+
+    async def _save(self, session, sid: str, phase: str, **data) -> str:
+        try:
+            await self._coord(session, "POST", "/sessions",
+                              {"session_id": sid, "phase": phase, **data})
+            return ""
+        except Exception as e:
+            return (f"\n\n⚠️ *Checkpoint not saved (coordinator unreachable: {e}) — "
+                    "not resumable if this chat is lost.*")
+
+    async def _load(self, session, sid: str) -> dict:
+        try:
+            return await self._coord(session, "GET", f"/sessions/{sid}")
+        except Exception:
+            return {}
+
+    async def _list_sessions(self, session) -> str:
+        try:
+            sessions = await self._coord(session, "GET", "/sessions")
+        except Exception as e:
+            return f"**Cannot list sessions** — coordinator unreachable:\n```\n{e}\n```"
+        vc = {k: s for k, s in sessions.items() if s.get("pipe") == "venture-council"}
+        if not vc:
+            return "No saved ventures yet. Describe your startup idea to begin."
+        rows = "\n".join(
+            f"| `{sid}` | {s.get('name','')} | `{s.get('phase','?')}` | {s.get('updated_seconds_ago','?')}s ago |"
+            for sid, s in vc.items()
+        )
+        return ("# 💾 Saved ventures\n\n| id | venture | phase | updated |\n|---|---|---|---|\n"
+                f"{rows}\n\nReply **resume <id>** to continue one.")
+
+    # -- council phases -------------------------------------------------------
+
+    def _core_prompts(self):
+        return {
+            "gap-scout": GAP_SCOUT_SYSTEM,
+            "market-analyst": MARKET_ANALYST_SYSTEM,
+            "tech-feasibility": TECH_SYSTEM,
+            "marketing-gtm": MARKETING_SYSTEM,
+        }
+
+    async def _design_roster(self, session, brief: str) -> list:
+        v = self.valves
+        raw = await self._chat(
+            session, v.STRATEGIST_MODEL,
+            ROSTER_SYSTEM.format(max_specialists=v.MAX_SPECIALISTS),
+            f"# Venture Brief\n{brief}",
+        )
+        try:
+            specialists = self._extract_json(raw).get("specialists", [])
+        except Exception:
+            specialists = []  # a bad roster never blocks the run
+        for s in specialists:
+            s["id"] = re.sub(r"[^\w-]", "_", str(s.get("id", "specialist")))
+        return specialists[: v.MAX_SPECIALISTS]
+
+    async def _run_experts(self, session, status, brief: str, roster: list,
+                           expert_ids: Optional[list] = None,
+                           findings: str = "") -> dict:
+        """Run core + spawned experts (all or a rerun subset). Returns id->report."""
+        v = self.valves
+        prompts = dict(self._core_prompts())
+        for s in roster:
+            prompts[s["id"]] = s.get("charter", "You are a specialist. Analyze the venture.")
+        ids = [i for i in (expert_ids or list(prompts)) if i in prompts]
+        user = f"# Venture Brief\n{brief}"
+        if findings:
+            user += f"\n\n# Red-team findings to address in your area\n{findings}"
+
+        async def one(i, eid):
+            await status(f"🔎 expert {i}/{len(ids)}: {eid}…")
+            return await self._chat(session, v.EXPERT_MODEL, prompts[eid], user)
+
+        reports = {}
+        if v.PARALLEL_EXPERTS:
+            results = await asyncio.gather(
+                *(one(i + 1, e) for i, e in enumerate(ids)), return_exceptions=True
+            )
+            for eid, res in zip(ids, results):
+                reports[eid] = f"(expert unavailable: {res})" if isinstance(res, Exception) else res
+        else:
+            for i, eid in enumerate(ids):
+                try:
+                    reports[eid] = await one(i + 1, eid)
+                except Exception as e:
+                    reports[eid] = f"(expert unavailable: {e})"
+        return reports
+
+    async def _stress_loop(self, session, status, brief: str, plan: str,
+                           roster: list, reports: dict, sections: list):
+        """Red team -> triage -> targeted rerun -> resynthesis, until FUND or cap.
+        Returns (plan, fund, rounds_used, roster, reports)."""
+        v = self.valves
+        fund, round_no = False, 0
+        for round_no in range(1, v.MAX_STRESS_ROUNDS + 1):
+            await status(f"🥊 Stress round {round_no}/{v.MAX_STRESS_ROUNDS}: skeptic + investor…")
+            target = f"# Venture Brief\n{brief}\n\n# Business Plan\n{plan}"
+            critiques = []
+            for persona, prompt in (("skeptic", SKEPTIC_SYSTEM), ("investor", INVESTOR_SYSTEM)):
+                try:
+                    res = await self._chat(session, v.REDTEAM_MODEL, prompt, target)
+                    critiques.append((persona, res, self._verdict_fund(res)))
+                except Exception as e:
+                    critiques.append((persona, f"(red team unavailable: {e})", True))
+            if v.SHOW_INTERMEDIATE:
+                for persona, text, ok in critiques:
+                    icon = "✅" if ok else "🛠️"
+                    sections.append(self._collapsible(
+                        f"{icon} Stress round {round_no} — {persona}", text))
+            if all(ok for _, _, ok in critiques):
+                fund = True
+                break
+
+            findings = "\n\n".join(
+                f"### {persona} findings\n{text}" for persona, text, ok in critiques if not ok
+            )
+            await status(f"🧭 {v.STRATEGIST_MODEL} triaging findings…")
+            rerun, spawned = [], []
+            try:
+                triage = self._extract_json(await self._chat(
+                    session, v.STRATEGIST_MODEL,
+                    TRIAGE_SYSTEM.format(
+                        max_specialists=v.MAX_SPECIALISTS,
+                        expert_ids=CORE_EXPERTS + [s["id"] for s in roster],
+                    ),
+                    f"# Findings\n{findings}\n\n# Current plan\n{plan}",
+                ))
+                rerun = triage.get("rerun", [])
+                spawned = triage.get("spawn", [])
+            except Exception:
+                pass  # fixable by revision alone
+            for s in spawned:
+                if len(roster) < v.MAX_SPECIALISTS:
+                    s["id"] = re.sub(r"[^\w-]", "_", str(s.get("id", "specialist")))
+                    roster.append(s)
+                    rerun.append(s["id"])
+            if rerun:
+                await status(f"✏️ reworking: {', '.join(rerun)}…")
+                reports.update(await self._run_experts(
+                    session, status, brief, roster, expert_ids=rerun, findings=findings))
+
+            await status(f"🧮 {v.STRATEGIST_MODEL} revising the plan…")
+            plan = await self._chat(
+                session, v.STRATEGIST_MODEL, RESYNTH_SYSTEM,
+                self._synth_input(brief, roster, reports)
+                + f"\n\n# Red-team findings to address\n{findings}\n\n# Previous plan\n{plan}",
+            )
+        return plan, fund, round_no, roster, reports
+
+    @staticmethod
+    def _synth_input(brief: str, roster: list, reports: dict) -> str:
+        parts = [f"# Venture Brief\n{brief}"]
+        for eid, rep in reports.items():
+            parts.append(f"# Expert report: {eid}\n{rep}")
+        if roster:
+            parts.append("# Spawned specialists\n" + "\n".join(
+                f"- {s['id']}: {s.get('title','')} — {s.get('why','')}" for s in roster))
+        return "\n\n".join(parts)
+
+    def _roster_section(self, roster: list) -> str:
+        lines = [f"- **{e}** (core)" for e in CORE_EXPERTS]
+        lines += [f"- **{s['id']}** (spawned) — {s.get('why', s.get('title', ''))}" for s in roster]
+        return "## Council Roster\n" + "\n".join(lines)
+
+    def _plan_message(self, plan: str, fund: bool, rounds: int, roster: list,
+                      reports: dict, sections: list, smark: str) -> str:
+        verdict = "FUND" if fund else f"REVISE after {rounds} round(s) — unresolved objections flagged below"
+        out = f"{PLAN_HEADING} — round {rounds}, red team: **{verdict}**\n\n"
+        out += self._roster_section(roster) + "\n\n" + plan + "\n"
+        if self.valves.SHOW_INTERMEDIATE:
+            expert_secs = [self._collapsible(f"🔎 Expert report — {eid}", rep)
+                           for eid, rep in reports.items()]
+            out += f"\n---\n{RECORDS_HEADING}\n\n" + "\n".join(expert_secs + sections)
+        out += self._footer(STATE_PLAN_REVIEW, self.GATE_TEXT, smark)
+        return out
+
+    async def _full_run(self, session, status, sid, smark, brief, sections=None,
+                        roster=None, reports=None, findings: str = ""):
+        """Roster -> experts -> synthesis -> stress loop -> plan message."""
+        v = self.valves
+        sections = sections if sections is not None else []
+        if roster is None:
+            await status(f"🧩 {v.STRATEGIST_MODEL} designing the council…")
+            roster = await self._design_roster(session, brief)
+        if reports is None:
+            reports = await self._run_experts(session, status, brief, roster, findings=findings)
+        await status(f"🧮 {v.STRATEGIST_MODEL} synthesizing the plan…")
+        synth_user = self._synth_input(brief, roster, reports)
+        if findings:
+            synth_user += f"\n\n# Address these findings\n{findings}"
+        plan = await self._chat(session, v.STRATEGIST_MODEL, SYNTHESIS_SYSTEM, synth_user)
+        plan, fund, rounds, roster, reports = await self._stress_loop(
+            session, status, brief, plan, roster, reports, sections)
+        note = await self._save(
+            session, sid, STATE_PLAN_REVIEW, pipe="venture-council",
+            name=self._name_from(brief), brief=brief, plan=plan,
+            roster=roster, reports=reports, fund=fund, rounds=rounds,
+        )
+        await status("Plan ready — your gate", done=True)
+        return self._plan_message(plan, fund, rounds, roster, reports, sections, smark) + note
+
+    # -- resume ---------------------------------------------------------------
+
+    async def _resume(self, session, sid: str) -> str:
+        data = await self._load(session, sid)
+        if not data:
+            return (f"**Cannot resume `{sid}`** — not found or coordinator unreachable. "
+                    "Reply **sessions** to list saved ventures.")
+        phase = data.get("phase", STATE_INTAKE)
+        smark = SESSION_MARKER.format(session=sid)
+        header = f"# 🔁 Resumed `{sid}` — {data.get('name','')} *(phase: {phase})*\n\n"
+        if phase == STATE_PLAN_REVIEW and data.get("plan"):
+            return header + self._plan_message(
+                data["plan"], data.get("fund", False), data.get("rounds", 1),
+                data.get("roster", []), data.get("reports", {}), [], smark)
+        if phase == STATE_DONE:
+            return header + (data.get("final") or "This venture's package was delivered.") \
+                + self._footer(STATE_DONE, "Describe the next idea or a pivot to start a new cycle.", smark)
+        draft = data.get("draft", "(no draft saved yet)")
+        return header + f"## Draft Venture Brief (restored)\n\n{draft}" \
+            + self._footer(STATE_INTAKE, self.INTAKE_TEXT, smark)
+
+    # -- main entry -----------------------------------------------------------
+
+    async def pipe(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[Any]]] = None,
+    ) -> str:
+        v = self.valves
+
+        async def status(msg: str, done: bool = False):
+            if __event_emitter__:
+                await __event_emitter__(
+                    {"type": "status", "data": {"description": msg, "done": done}})
+
+        messages = body.get("messages", [])
+        state = self._scan_marker(messages, STATE_RE) or STATE_INTAKE
+        user_msg = self._last_user(messages)
+        approved = bool(APPROVE_RE.match(user_msg))
+        existing_sid = self._scan_marker(messages, SESSION_RE)
+        sid = existing_sid or uuid.uuid4().hex[:8]
+        smark = SESSION_MARKER.format(session=sid)
+
+        if not user_msg.strip():
+            return ("Tell me about your startup idea — whatever you know. Facts, guesses, "
+                    "and estimates are all welcome; I'll label them. "
+                    "(Or **sessions** to resume a saved venture.)")
+
+        try:
+            async with aiohttp.ClientSession() as session:
+
+                # ---- recovery commands ----
+                if SESSIONS_RE.match(user_msg):
+                    return await self._list_sessions(session)
+                resume = RESUME_RE.match(user_msg)
+                if resume:
+                    await status(f"🔁 Resuming {resume.group(1)}…", done=True)
+                    return await self._resume(session, resume.group(1))
+
+                # ---- INTAKE: interview toward the Venture Brief ----
+                if state == STATE_INTAKE and not approved:
+                    await status(f"🧠 {v.INTERVIEW_MODEL} drafting the venture brief…")
+                    draft = await self._chat(
+                        session, v.INTERVIEW_MODEL, INTAKE_SYSTEM,
+                        f"# Conversation so far\n{self._history(messages)}")
+                    extra = {} if existing_sid else {"name": self._name_from(user_msg)}
+                    note = await self._save(session, sid, STATE_INTAKE,
+                                            pipe="venture-council", draft=draft, **extra)
+                    await status("Done", done=True)
+                    return draft + self._footer(STATE_INTAKE, self.INTAKE_TEXT, smark) + note
+
+                # ---- BRIEF APPROVED: convene the council ----
+                if state == STATE_INTAKE and approved:
+                    await status(f"📄 {v.INTERVIEW_MODEL} locking the brief…")
+                    brief = await self._chat(
+                        session, v.INTERVIEW_MODEL, BRIEF_FINALIZE_SYSTEM,
+                        f"# Conversation so far\n{self._history(messages)}")
+                    return await self._full_run(session, status, sid, smark, brief)
+
+                # ---- PLAN GATE ----
+                if state == STATE_PLAN_REVIEW:
+                    cp = await self._load(session, sid)
+                    brief, plan = cp.get("brief", ""), cp.get("plan", "")
+                    roster, reports = cp.get("roster", []), cp.get("reports", {})
+                    if not (brief and plan):
+                        return ("I lost this venture's checkpoint (coordinator down or state "
+                                "cleared). Reply **sessions** to look for it, or restate the idea."
+                                + self._footer(STATE_INTAKE, self.INTAKE_TEXT, smark))
+
+                    if SHOW_PLAN_RE.match(user_msg):
+                        return self._plan_message(plan, cp.get("fund", False),
+                                                  cp.get("rounds", 1), roster, reports, [], smark)
+                    if SHOW_BOARD_RE.match(user_msg):
+                        start = plan.rfind(BOARD_HEADING)
+                        board = plan[start:] if start != -1 else "(no board found in the plan)"
+                        board = board.split("\n## ")[0]
+                        return board + self._footer(STATE_PLAN_REVIEW, self.GATE_TEXT, smark)
+
+                    board_answer = BOARD_ANSWER_RE.match(user_msg)
+                    if board_answer:
+                        findings = (
+                            "The founder answered a Kill/Pursue Board question with real-world "
+                            f"information: \"{board_answer.group(1).strip()}\". Collapse the "
+                            "affected branches, recompute financials/roadmap from the model "
+                            "inputs, resolve the question on the board, and append to the "
+                            "Decision Log.")
+                    elif not approved:
+                        findings = f"### Founder feedback\n{user_msg}"
+                    else:
+                        # approved -> final package
+                        await status(f"🚀 {v.STRATEGIST_MODEL} producing the final package…")
+                        final = await self._chat(
+                            session, v.STRATEGIST_MODEL, FINAL_SYSTEM,
+                            f"# Venture Brief\n{brief}\n\n# Approved Plan\n{plan}")
+                        note = await self._save(session, sid, STATE_DONE,
+                                                pipe="venture-council", final=final)
+                        await status("Done", done=True)
+                        return final + self._footer(
+                            STATE_DONE,
+                            "🎉 Package delivered. Describe the next idea, a pivot, or a deep-dive "
+                            "to start a new cycle — everything here carries as context.",
+                            smark) + note
+
+                    # feedback or board answer -> targeted rework + fresh stress pass
+                    await status(f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
+                    return await self._full_run(
+                        session, status, sid, smark, brief,
+                        roster=roster, reports=reports, findings=findings)
+
+                # ---- DONE: any message starts the next cycle ----
+                await status(f"🧠 {v.INTERVIEW_MODEL} starting the next cycle…")
+                draft = await self._chat(
+                    session, v.INTERVIEW_MODEL, INTAKE_SYSTEM,
+                    f"# Conversation so far (includes the previous venture/plan)\n{self._history(messages)}")
+                sid = uuid.uuid4().hex[:8]
+                smark = SESSION_MARKER.format(session=sid)
+                note = await self._save(session, sid, STATE_INTAKE, pipe="venture-council",
+                                        name=self._name_from(user_msg), draft=draft)
+                await status("Done", done=True)
+                return draft + self._footer(STATE_INTAKE, self.INTAKE_TEXT, smark) + note
+
+        except Exception as e:
+            await status("Failed", done=True)
+            return (
+                f"**Pipeline error** — check claude-wrapper (`{v.CLAUDE_BASE_URL}`) "
+                f"and the coordinator (`{v.COORDINATOR_URL}`).\n\n```\n{e}\n```"
+                + self._footer(state, "Resend your last message to retry from where we left off.", smark)
+            )

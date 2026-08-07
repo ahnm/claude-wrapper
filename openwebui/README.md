@@ -1,3 +1,36 @@
+# OpenWebUI pipes: Architect Council & Venture Council
+
+## Venture Council (`venture_council.py`)
+
+Multi-agent startup pipeline, all agents via claude-wrapper. Flow: intake
+interview → **Venture Brief** framed on the Four Anchors (significant problem,
+significant value, robust market, founder/timing fit) with every gap labeled
+⚠️ estimate/guess → your **approve** gate → the strategist designs a dynamic
+council (4 core experts — gap-scout, market-analyst with the LeanB2B factor
+table, tech-feasibility, marketing-gtm — plus up to `MAX_SPECIALISTS` spawned
+specialists chartered for your specific idea) → synthesis into a business plan
+with formula-driven financials (3 scenarios, cost/burn/runway tables), roadmap,
+Anchor Scorecard, and a **Kill/Pursue Board** (founder-only questions ranked by
+impact×uncertainty with IF-YES/IF-NO branch effects — transparent, never
+blocking) → skeptic + investor red team with unit-economics tripwires,
+findings triaged back to affected experts (spawning new specialists if needed)
+until `FUND` or the round cap → your plan gate → investor one-pager + 2-week
+validation sprint with pre-committed decision rules + decision log.
+
+At the plan gate: **approve**, plain feedback (goes through the rework loop),
+`board: <answer>` (collapses that question's branches and recomputes),
+`board` / `plan` (re-show). `sessions` / `resume <id>` work via the
+coordinator checkpoints. Install like the Architect Council below; key valves:
+`INTERVIEW_MODEL`/`EXPERT_MODEL` (sonnet), `STRATEGIST_MODEL`/`REDTEAM_MODEL`
+(opus), `MAX_SPECIALISTS`, `MAX_STRESS_ROUNDS`, `PARALLEL_EXPERTS` (off unless
+your wrapper handles concurrent sessions).
+
+Honest limits: no web access — market and competitor numbers are model
+knowledge + your inputs, always labeled in the Assumption Register with a
+real-world validation list.
+
+---
+
 # Architect Council — gated multi-model build system for OpenWebUI
 
 Claude (via claude-wrapper) is the Principal Investigator; local Ollama models
