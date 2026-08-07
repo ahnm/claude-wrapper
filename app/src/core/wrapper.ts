@@ -262,30 +262,12 @@ export class CoreWrapper implements ICoreWrapper {
   }
 
   private shouldUseFormatInstructions(request: OpenAIRequest): boolean {
-    // Always use formatting if tools are present
-    if (request.tools && request.tools.length > 0) {
-      return true;
-    }
-
-    // Use formatting for multi-turn conversations (more than 2 messages)
-    if (request.messages.length > 2) {
-      return true;
-    }
-
-    // Use formatting if there's a system message
-    const hasSystemMessage = request.messages.some(msg => msg.role === 'system');
-    if (hasSystemMessage) {
-      return true;
-    }
-
-    // Use formatting for long user messages (likely complex requests)
-    const lastUserMessage = request.messages.filter(msg => msg.role === 'user').pop();
-    if (lastUserMessage && typeof lastUserMessage.content === 'string' && lastUserMessage.content.length > 200) {
-      return true;
-    }
-
-    // Skip formatting for simple single-turn questions
-    return false;
+    // Only tool-call requests need the model-authored JSON envelope. For plain
+    // chat, asking the model to hand-write the completion JSON corrupts large
+    // responses (unescaped quotes/control chars), which then fail validation
+    // and get double-wrapped. Plain responses are wrapped server-side in
+    // validateAndCorrect instead, which is always well-formed.
+    return !!(request.tools && request.tools.length > 0);
   }
 
   private createFormatTemplate(requestId: string, timestamp: number, model: string): string {

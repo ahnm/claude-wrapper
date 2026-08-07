@@ -307,15 +307,27 @@ class Pipe:
     @staticmethod
     def _unwrap_completion(text: str) -> str:
         """claude-wrapper sometimes double-encodes: the content field itself
-        holds a serialized chat-completion JSON. Unwrap until we hit prose."""
+        holds a serialized chat-completion JSON — occasionally MALFORMED
+        (model-authored envelope with bad escaping). Unwrap until prose."""
         for _ in range(3):
             s = text.strip()
             if not (s.startswith("{") and '"choices"' in s):
                 break
             try:
                 text = json.loads(s)["choices"][0]["message"]["content"]
+                continue
             except Exception:
+                pass
+            m = re.search(r'"content"\s*:\s*"(.*)"\s*\}\s*,\s*"finish_reason"',
+                          s, re.DOTALL)
+            if not m:
                 break
+            raw = m.group(1)
+            try:
+                text = json.loads(f'"{raw}"')
+            except Exception:
+                text = (raw.replace("\\n", "\n").replace('\\"', '"')
+                        .replace("\\t", "\t").replace("\\\\", "\\"))
         return text
 
     async def _claude(self, session, system: str, user: str) -> str:

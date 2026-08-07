@@ -44,6 +44,8 @@ SHOW_BOARD_RE = re.compile(r"^\s*board\s*$", re.IGNORECASE)
 SHOW_PLAN_RE = re.compile(r"^\s*plan\s*$", re.IGNORECASE)
 SESSIONS_RE = re.compile(r"^\s*sessions\s*$", re.IGNORECASE)
 RESUME_RE = re.compile(r"^\s*resume\s+(\w+)\s*$", re.IGNORECASE)
+NEW_VENTURE_RE = re.compile(r"^\s*new(?:\s+venture)?\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
+REVISE_RE = re.compile(r"^\s*(?:revise|rework)\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
 
 BRIEF_HEADING = "# 📄 Venture Brief"
 PLAN_HEADING = "# 📊 Business Plan"
@@ -228,6 +230,21 @@ You are REVISING an existing plan. Address every finding explicitly: change
 the plan or rebut with justification (add a '## Findings Addressed' section
 at the end, before nothing else follows it). Append to the Decision Log."""
 
+ADVISOR_SYSTEM = """You are the venture strategist continuing to advise the
+founder after the plan was delivered. The venture brief, business plan, and
+final package below are ground truth. The founder may:
+- ask questions about any part of the plan — answer from the plan, citing its
+  numbers and their [fact]/[estimate]/[guess] labels; never invent new facts
+- request documents: pitch deck outline, executive summary, investor email,
+  one-pager, job spec, landing-page copy, validation-call script, etc. —
+  produce them fully, consistent with the plan
+- explore what-if scenarios — recompute from the plan's stated formulas and
+  inputs, labeling changed assumptions
+
+Stay consistent with the plan. If something truly requires re-running the
+expert council (structural changes, new evidence), say so and suggest
+`revise: <the change>`. Respond in clean markdown."""
+
 FINAL_SYSTEM = """You are the lead strategist producing the final founder
 package from the approved plan. Output markdown:
 
@@ -315,15 +332,28 @@ class Pipe:
     @staticmethod
     def _unwrap_completion(text: str) -> str:
         """claude-wrapper sometimes double-encodes: the content field itself
-        holds a serialized chat-completion JSON. Unwrap until we hit prose."""
+        holds a serialized chat-completion JSON — occasionally MALFORMED
+        (model-authored envelope with bad escaping). Unwrap until prose."""
         for _ in range(3):
             s = text.strip()
             if not (s.startswith("{") and '"choices"' in s):
                 break
             try:
                 text = json.loads(s)["choices"][0]["message"]["content"]
+                continue
             except Exception:
+                pass
+            # malformed envelope: extract the content field by pattern
+            m = re.search(r'"content"\s*:\s*"(.*)"\s*\}\s*,\s*"finish_reason"',
+                          s, re.DOTALL)
+            if not m:
                 break
+            raw = m.group(1)
+            try:
+                text = json.loads(f'"{raw}"')
+            except Exception:
+                text = (raw.replace("\\n", "\n").replace('\\"', '"')
+                        .replace("\\t", "\t").replace("\\\\", "\\"))
         return text
 
     async def _coord(self, session, method: str, path: str, payload=None):
@@ -409,6 +439,11 @@ class Pipe:
     INTAKE_TEXT = (
         "💬 Answer, correct any assumption, or add facts (guesses are fine — they're labeled). "
         "Reply **approve** to convene the council."
+    )
+    DONE_TEXT = (
+        "💬 Ask anything or request docs (pitch deck, exec summary, investor email, what-ifs…) — "
+        "I'll answer from the plan · **revise: <feedback>** reworks the plan through the council · "
+        "**new venture: <idea>** starts the next cycle."
     )
 
     # -- checkpoints ----------------------------------------------------------
@@ -628,8 +663,8 @@ class Pipe:
                 data["plan"], data.get("fund", False), data.get("rounds", 1),
                 data.get("roster", []), data.get("reports", {}), [], smark)
         if phase == STATE_DONE:
-            return header + (data.get("final") or "This venture's package was delivered.") \
-                + self._footer(STATE_DONE, "Describe the next idea or a pivot to start a new cycle.", smark)
+            final = self._unwrap_completion(data.get("final") or "This venture's package was delivered.")
+            return header + final + self._footer(STATE_DONE, self.DONE_TEXT, smark)
         draft = data.get("draft", "(no draft saved yet)")
         return header + f"## Draft Venture Brief (restored)\n\n{draft}" \
             + self._footer(STATE_INTAKE, self.INTAKE_TEXT, smark)
@@ -696,7 +731,10 @@ class Pipe:
                 # ---- PLAN GATE ----
                 if state == STATE_PLAN_REVIEW:
                     cp = await self._load(session, sid)
-                    brief, plan = cp.get("brief", ""), cp.get("plan", "")
+                    brief = cp.get("brief", "")
+                    # unwrap self-heals checkpoints saved while the wrapper
+                    # was double-encoding responses
+                    plan = self._unwrap_completion(cp.get("plan", ""))
                     roster, reports = cp.get("roster", []), cp.get("reports", {})
                     if not (brief and plan):
                         return ("I lost this venture's checkpoint (coordinator down or state "
@@ -732,9 +770,7 @@ class Pipe:
                                                 pipe="venture-council", final=final)
                         await status("Done", done=True)
                         return final + self._footer(
-                            STATE_DONE,
-                            "🎉 Package delivered. Describe the next idea, a pivot, or a deep-dive "
-                            "to start a new cycle — everything here carries as context.",
+                            STATE_DONE, "🎉 Package delivered. " + self.DONE_TEXT,
                             smark) + note
 
                     # feedback or board answer -> targeted rework + fresh stress pass
@@ -743,15 +779,48 @@ class Pipe:
                         session, status, sid, smark, brief,
                         roster=roster, reports=reports, findings=findings)
 
-                # ---- DONE: any message starts the next cycle ----
+                # ---- DONE: advise / revise / new venture ----
+                new_v = NEW_VENTURE_RE.match(user_msg)
+                revise = None if new_v else REVISE_RE.match(user_msg)
+
+                if revise:
+                    cp = await self._load(session, sid)
+                    brief = cp.get("brief", "")
+                    plan = self._unwrap_completion(cp.get("plan", ""))
+                    if brief and plan:
+                        await status(f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
+                        return await self._full_run(
+                            session, status, sid, smark, brief,
+                            roster=cp.get("roster", []), reports=cp.get("reports", {}),
+                            findings=f"### Founder feedback after delivery\n{revise.group(1).strip()}")
+                    # checkpoint incomplete → fall through to advisor
+
+                if not new_v:
+                    # advisor mode: Q&A, docs, what-ifs — grounded in the plan
+                    await status(f"💬 {v.STRATEGIST_MODEL} advising…")
+                    cp = await self._load(session, sid)
+                    context = (
+                        f"# Venture Brief\n{cp.get('brief', '(not saved)')}\n\n"
+                        f"# Business Plan\n{self._unwrap_completion(cp.get('plan', '(not saved)'))}\n\n"
+                        f"# Final Package\n{self._unwrap_completion(cp.get('final', '(not saved)'))}\n\n"
+                        f"# Recent conversation\n{self._history(messages[-8:])}\n\n"
+                        f"# Founder's request\n{user_msg}"
+                    )
+                    answer = await self._chat(session, v.STRATEGIST_MODEL, ADVISOR_SYSTEM, context)
+                    await status("Done", done=True)
+                    return answer + self._footer(STATE_DONE, self.DONE_TEXT, smark)
+
+                # explicit new venture → fresh cycle, fresh checkpoint
                 await status(f"🧠 {v.INTERVIEW_MODEL} starting the next cycle…")
+                idea = new_v.group(1).strip()
                 draft = await self._chat(
                     session, v.INTERVIEW_MODEL, INTAKE_SYSTEM,
-                    f"# Conversation so far (includes the previous venture/plan)\n{self._history(messages)}")
+                    f"# Conversation so far (includes the previous venture/plan)\n{self._history(messages)}"
+                    f"\n\n# New venture idea\n{idea}")
                 sid = uuid.uuid4().hex[:8]
                 smark = SESSION_MARKER.format(session=sid)
                 note = await self._save(session, sid, STATE_INTAKE, pipe="venture-council",
-                                        name=self._name_from(user_msg), draft=draft)
+                                        name=self._name_from(idea), draft=draft)
                 await status("Done", done=True)
                 return draft + self._footer(STATE_INTAKE, self.INTAKE_TEXT, smark) + note
 
