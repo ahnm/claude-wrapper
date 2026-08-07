@@ -233,7 +233,4 @@ export class ClaudeResolver implements IClaudeResolver {
     }
   }
 
-  private escapeShellString(str: string): string {
-    return str.replace(/'/g, "'\"'\"'");
-  }
 }
