@@ -299,7 +299,22 @@ class Pipe:
                     f"{model} @ {v.CLAUDE_BASE_URL} -> {resp.status}: {(await resp.text())[:500]}"
                 )
             text = (await resp.json())["choices"][0]["message"]["content"]
+            text = self._unwrap_completion(text)
             return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    @staticmethod
+    def _unwrap_completion(text: str) -> str:
+        """claude-wrapper sometimes double-encodes: the content field itself
+        holds a serialized chat-completion JSON. Unwrap until we hit prose."""
+        for _ in range(3):
+            s = text.strip()
+            if not (s.startswith("{") and '"choices"' in s):
+                break
+            try:
+                text = json.loads(s)["choices"][0]["message"]["content"]
+            except Exception:
+                break
+        return text
 
     async def _coord(self, session, method: str, path: str, payload=None):
         v = self.valves

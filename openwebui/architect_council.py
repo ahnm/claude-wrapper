@@ -302,7 +302,21 @@ class Pipe:
                 text = await resp.text()
                 raise RuntimeError(f"{model} @ {base_url} returned {resp.status}: {text[:500]}")
             data = await resp.json()
-            return data["choices"][0]["message"]["content"]
+            return self._unwrap_completion(data["choices"][0]["message"]["content"])
+
+    @staticmethod
+    def _unwrap_completion(text: str) -> str:
+        """claude-wrapper sometimes double-encodes: the content field itself
+        holds a serialized chat-completion JSON. Unwrap until we hit prose."""
+        for _ in range(3):
+            s = text.strip()
+            if not (s.startswith("{") and '"choices"' in s):
+                break
+            try:
+                text = json.loads(s)["choices"][0]["message"]["content"]
+            except Exception:
+                break
+        return text
 
     async def _claude(self, session, system: str, user: str) -> str:
         return await self._chat(

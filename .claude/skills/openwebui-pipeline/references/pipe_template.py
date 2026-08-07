@@ -8,6 +8,7 @@ description: >-
 requirements: aiohttp
 """
 
+import json
 import re
 from typing import Any, Awaitable, Callable, Optional
 
@@ -76,6 +77,16 @@ class Pipe:
                     f"{model} @ {base_url} -> {resp.status}: {(await resp.text())[:500]}"
                 )
             text = (await resp.json())["choices"][0]["message"]["content"]
+            # claude-wrapper sometimes double-encodes: content holds a
+            # serialized completion JSON — unwrap until we hit prose
+            for _ in range(3):
+                s = text.strip()
+                if not (s.startswith("{") and '"choices"' in s):
+                    break
+                try:
+                    text = json.loads(s)["choices"][0]["message"]["content"]
+                except Exception:
+                    break
             # reasoning models wrap chain-of-thought in <think> tags
             return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 

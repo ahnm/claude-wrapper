@@ -102,6 +102,11 @@ class Pipe:
 - **Strip reasoning tags** from local-model output before parsing:
   `re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)` — deepseek-r1
   and friends will otherwise break your verdict parsing.
+- **Unwrap double-encoded completions**: claude-wrapper can return the real
+  content as a serialized completion JSON *inside* the content field. After
+  extracting content, loop: while it starts with `{` and contains
+  `"choices"`, `json.loads` it and take `choices[0].message.content` again
+  (see the template's `_chat`). Without this the chat shows raw JSON.
 - **Never let an exception escape `pipe()`** — catch everything, return a
   markdown error naming which endpoint likely failed, and include the state
   footer so the user can "resend your last message to retry".
