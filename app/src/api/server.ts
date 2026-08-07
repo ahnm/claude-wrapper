@@ -19,7 +19,8 @@ const app = express();
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Large limit: multi-agent pipelines send prompts with many embedded reports
+app.use(express.json({ limit: '50mb' }));
 
 // Enhanced request/response logging middleware (debug mode)
 if (EnvironmentManager.isDebugMode()) {

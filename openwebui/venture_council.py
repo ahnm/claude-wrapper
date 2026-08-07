@@ -270,6 +270,10 @@ class Pipe:
             default=True, description="Expert reports and stress rounds as collapsible sections."
         )
         HISTORY_CHAR_BUDGET: int = Field(default=60000, description="Max history characters passed to models.")
+        MAX_PROMPT_CHARS: int = Field(
+            default=200000,
+            description="Hard cap per model prompt; oversized prompts are middle-truncated (protects wrapper body limits and latency).",
+        )
         REQUEST_TIMEOUT: int = Field(default=600, description="Per-request timeout in seconds.")
 
     def __init__(self):
@@ -282,6 +286,12 @@ class Pipe:
 
     async def _chat(self, session, model: str, system: str, user: str) -> str:
         v = self.valves
+        if len(user) > v.MAX_PROMPT_CHARS:
+            keep_head = int(v.MAX_PROMPT_CHARS * 0.65)
+            keep_tail = v.MAX_PROMPT_CHARS - keep_head
+            user = (user[:keep_head]
+                    + "\n\n[... middle truncated to fit prompt budget ...]\n\n"
+                    + user[-keep_tail:])
         headers = {"Content-Type": "application/json"}
         if v.CLAUDE_API_KEY:
             headers["Authorization"] = f"Bearer {v.CLAUDE_API_KEY}"
