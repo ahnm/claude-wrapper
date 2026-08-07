@@ -25,15 +25,50 @@ coordinator/worker system (`openwebui/coordinator.py`, `openwebui/worker.py`).
 
 ## Process
 
-1. **Design the pipeline first**: list phases, which model plays which role in
-   each phase, where user approval gates sit, and what must survive a lost
-   chat. Confirm the shape with the user before coding.
-2. Start from `references/pipe_template.py` (minimal two-phase pipe with one
-   gate) or extend `architect_council.py`.
+1. **Preview the design and iterate — do NOT write code yet.** Present a
+   design preview (format below) and ask what to change. Revise the preview
+   through as many rounds as the user wants; only implement after they
+   approve it. This mirrors the gates the pipes themselves use.
+2. Once approved, start from `references/pipe_template.py` (minimal two-phase
+   pipe with one gate) or extend `architect_council.py`.
 3. Syntax-check with `python -c "import ast; ast.parse(open(f).read())"` —
    the file cannot be executed locally (OpenWebUI imports it server-side).
 4. Give the user install steps: paste into Admin → Functions, enable, set
    Valves.
+
+## Design preview format
+
+Show all three parts — the goal is that the user can *see the pipeline
+running* before a line of code exists:
+
+1. **Phase diagram** — one line per phase: trigger → role(model) → output →
+   what advances it. Mark user gates explicitly:
+
+   ```
+   1. Interview      user msg   → drafter(sonnet)        → draft spec     ⟳ iterate
+   2. 🚦 GATE        "approve"  → locks spec
+   3. Review         auto       → reviewers(r1, qwen)    → verdicts       ⟳ until unanimous
+   4. Build          auto       → builder(qwen-coder)    → implementation → done
+   ```
+
+2. **Valve table** — every knob with its default (endpoints, models, rounds,
+   toggles).
+
+3. **Mock chat transcript** — a short fake conversation showing exactly what
+   the user will see each turn: the status lines while phases run, the shape
+   of each reply (headings, tables, collapsibles), and the footer with the
+   gate options. Example turn:
+
+   > *(status: 🔍 Council round 1/2: deepseek-r1:32b…)*
+   >
+   > `# 📐 Proposed Plan` … `<details>reviewer critiques</details>`
+   >
+   > ---
+   > 🚦 **Gate: your call.** Reply **approve** to build, or reply with
+   > feedback to revise.
+
+When the user requests changes, re-show the *whole updated preview* (not a
+diff) so they always gate on the full picture.
 
 ## Pipe anatomy (required shape)
 
