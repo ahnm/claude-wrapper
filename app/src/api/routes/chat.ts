@@ -22,7 +22,18 @@ router.post('/v1/chat/completions',
     });
 
     const request: OpenAIRequest = req.body;
-    
+
+    // Kill the Claude CLI subprocess if the client disconnects mid-request —
+    // otherwise aborted requests keep burning tokens to completion.
+    const abortController = new AbortController();
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        logger.warn('Client disconnected — aborting Claude CLI execution');
+        abortController.abort();
+      }
+    });
+
+
     // Validate required fields
     if (!request.model || !request.messages || !Array.isArray(request.messages)) {
       throw new InvalidRequestError('Invalid request format: model and messages are required');
@@ -59,7 +70,7 @@ router.post('/v1/chat/completions',
       });
       
       // Handle non-streaming request
-      const response = await coreWrapper.handleChatCompletion(request);
+      const response = await coreWrapper.handleChatCompletion(request, abortController.signal);
       
       logger.info('Chat completion request completed successfully', {
         requestId: response.id,

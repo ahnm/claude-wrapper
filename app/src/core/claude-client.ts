@@ -10,11 +10,11 @@ export class ClaudeClient implements IClaudeClient {
     this.resolver = new ClaudeResolver();
   }
 
-  async execute(request: ClaudeRequest): Promise<string> {
-    return this.executeWithSession(request, null, false);
+  async execute(request: ClaudeRequest, signal?: AbortSignal): Promise<string> {
+    return this.executeWithSession(request, null, false, signal);
   }
 
-  async executeWithSession(request: ClaudeRequest, sessionId: string | null, useJsonOutput: boolean): Promise<string> {
+  async executeWithSession(request: ClaudeRequest, sessionId: string | null, useJsonOutput: boolean, signal?: AbortSignal): Promise<string> {
     try {
       const prompt = this.messagesToPrompt(request.messages, request.tools);
       logger.debug('Converting messages to prompt', { 
@@ -26,10 +26,11 @@ export class ClaudeClient implements IClaudeClient {
       });
       
       const result = await this.resolver.executeClaudeCommandWithSession(
-        prompt, 
-        request.model, 
-        sessionId, 
-        useJsonOutput
+        prompt,
+        request.model,
+        sessionId,
+        useJsonOutput,
+        signal
       );
       
       logger.info('Claude execution completed successfully', {

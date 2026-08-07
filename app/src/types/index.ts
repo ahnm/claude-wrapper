@@ -61,8 +61,8 @@ export interface ClaudeRequest {
 
 // Core Interface Contracts (SOLID Principles)
 export interface IClaudeClient {
-  execute(request: ClaudeRequest): Promise<string>;
-  executeWithSession(request: ClaudeRequest, sessionId: string | null, useJsonOutput: boolean): Promise<string>;
+  execute(request: ClaudeRequest, signal?: AbortSignal): Promise<string>;
+  executeWithSession(request: ClaudeRequest, sessionId: string | null, useJsonOutput: boolean, signal?: AbortSignal): Promise<string>;
 }
 
 export interface IClaudeResolver {

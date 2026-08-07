@@ -54,6 +54,10 @@ BOARD_HEADING = "## 🎯 Kill/Pursue Board"
 
 CORE_EXPERTS = ["gap-scout", "market-analyst", "tech-feasibility", "marketing-gtm"]
 
+
+class StopRun(Exception):
+    """User pressed stop (client disconnected) — halt between phases."""
+
 # ---------------------------------------------------------------------------
 # Role prompts
 # ---------------------------------------------------------------------------
@@ -703,10 +707,21 @@ class Pipe:
         body: dict,
         __user__: Optional[dict] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[Any]]] = None,
+        __request__: Optional[Any] = None,
     ) -> str:
         v = self.valves
 
         async def status(msg: str, done: bool = False):
+            # every phase reports here first, so this doubles as the stop check:
+            # pressing stop disconnects the client and halts before the next phase
+            if __request__ is not None and not done:
+                try:
+                    if await __request__.is_disconnected():
+                        raise StopRun()
+                except StopRun:
+                    raise
+                except Exception:
+                    pass  # older OpenWebUI without is_disconnected
             if __event_emitter__:
                 await __event_emitter__(
                     {"type": "status", "data": {"description": msg, "done": done}})
@@ -849,6 +864,12 @@ class Pipe:
                 await status("Done", done=True)
                 return draft + self._footer(STATE_INTAKE, self.INTAKE_TEXT, smark) + note
 
+        except StopRun:
+            return (
+                "⏹️ **Stopped at your request.** Progress up to the last completed phase is "
+                "checkpointed."
+                + self._footer(state, "Resend your last message to continue from where we left off.", smark)
+            )
         except Exception as e:
             await status("Failed", done=True)
             return (

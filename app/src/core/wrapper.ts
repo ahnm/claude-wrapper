@@ -35,7 +35,7 @@ export class CoreWrapper implements ICoreWrapper {
     this.validator = validator || new ResponseValidator();
   }
 
-  async handleChatCompletion(request: OpenAIRequest): Promise<OpenAIResponse> {
+  async handleChatCompletion(request: OpenAIRequest, signal?: AbortSignal): Promise<OpenAIResponse> {
     logger.info('Processing chat completion request', {
       model: request.model,
       messageCount: request.messages.length,
@@ -44,21 +44,21 @@ export class CoreWrapper implements ICoreWrapper {
 
     // Detect if we have a system prompt and check for existing session
     const sessionInfo = this.detectSystemPromptSession(request.messages);
-    
+
     if (sessionInfo.isNewSession) {
       // Create new Claude session or process normally
       if (sessionInfo.systemPromptHash) {
-        return this.initializeSystemPromptSession(request, sessionInfo.systemPromptHash);
+        return this.initializeSystemPromptSession(request, sessionInfo.systemPromptHash, signal);
       } else {
-        return this.processNormally(request);
+        return this.processNormally(request, signal);
       }
     } else {
       // Resume existing Claude session
       if (sessionInfo.claudeSessionId && sessionInfo.sessionState) {
-        return this.processWithSession(request, sessionInfo.claudeSessionId);
+        return this.processWithSession(request, sessionInfo.claudeSessionId, signal);
       } else {
         // Fallback to normal processing if session data is incomplete
-        return this.processNormally(request);
+        return this.processNormally(request, signal);
       }
     }
   }
@@ -132,12 +132,12 @@ export class CoreWrapper implements ICoreWrapper {
     };
   }
 
-  private async initializeSystemPromptSession(request: OpenAIRequest, systemPromptHash: string): Promise<OpenAIResponse> {
+  private async initializeSystemPromptSession(request: OpenAIRequest, systemPromptHash: string, signal?: AbortSignal): Promise<OpenAIResponse> {
     logger.info('Initializing system prompt session', { systemPromptHash });
-    
+
     // Stage 1: Setup system prompt session
     const systemPrompts = this.extractSystemPrompts(request.messages);
-    const sessionId = await this.createSystemPromptSession(systemPrompts);
+    const sessionId = await this.createSystemPromptSession(systemPrompts, signal);
     
     // Store the session mapping
     const systemPromptContent = systemPrompts.map(msg => msg.content).join('\n\n');
@@ -157,14 +157,14 @@ export class CoreWrapper implements ICoreWrapper {
     return this.processWithSession(request, sessionId);
   }
 
-  private async createSystemPromptSession(systemPrompts: OpenAIMessage[]): Promise<string> {
+  private async createSystemPromptSession(systemPrompts: OpenAIMessage[], signal?: AbortSignal): Promise<string> {
     const systemContent = systemPrompts.map(msg => msg.content).join('\n\n');
     const setupRequest: ClaudeRequest = {
       model: 'sonnet',
       messages: [{ role: 'system' as const, content: systemContent }]
     };
-    
-    const response = await this.claudeClient.executeWithSession(setupRequest, null, true);
+
+    const response = await this.claudeClient.executeWithSession(setupRequest, null, true, signal);
     const { sessionId } = this.parseClaudeSessionResponse(response);
     
     if (!sessionId) {
@@ -174,17 +174,18 @@ export class CoreWrapper implements ICoreWrapper {
     return sessionId;
   }
 
-  private async processWithSession(request: OpenAIRequest, sessionId: string): Promise<OpenAIResponse> {
+  private async processWithSession(request: OpenAIRequest, sessionId: string, signal?: AbortSignal): Promise<OpenAIResponse> {
     logger.info('Processing with existing Claude session', { sessionId });
-    
+
     // Strip system prompts and process remaining messages
     const strippedRequest = this.stripSystemPrompts(request);
     const claudeRequest = this.addFormatInstructions(strippedRequest);
-    
+
     const rawResponse = await this.claudeClient.executeWithSession(
-      claudeRequest, 
-      sessionId, 
-      false // Regular mode, not JSON
+      claudeRequest,
+      sessionId,
+      false, // Regular mode, not JSON
+      signal
     );
     
     // Update session state
@@ -197,11 +198,11 @@ export class CoreWrapper implements ICoreWrapper {
     return this.validateAndCorrect(rawResponse, claudeRequest);
   }
 
-  private async processNormally(request: OpenAIRequest): Promise<OpenAIResponse> {
+  private async processNormally(request: OpenAIRequest, signal?: AbortSignal): Promise<OpenAIResponse> {
     logger.info('Processing without session optimization');
-    
+
     const claudeRequest = this.addFormatInstructions(request);
-    const rawResponse = await this.claudeClient.execute(claudeRequest);
+    const rawResponse = await this.claudeClient.execute(claudeRequest, signal);
     
     return this.validateAndCorrect(rawResponse, claudeRequest);
   }

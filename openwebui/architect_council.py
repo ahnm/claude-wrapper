@@ -45,6 +45,10 @@ RETRY_RE = re.compile(r"^\s*retry\s*[.!]*\s*$", re.IGNORECASE)
 SESSIONS_RE = re.compile(r"^\s*sessions\s*$", re.IGNORECASE)
 RESUME_RE = re.compile(r"^\s*resume\s+(\w+)\s*$", re.IGNORECASE)
 
+class StopRun(Exception):
+    """User pressed stop (client disconnected) — halt between phases."""
+
+
 SPEC_HEADING = "# 📄 Feature Spec"
 PLAN_HEADING = "# 📐 Proposed Plan"
 CHUNKS_HEADING = "# 🧩 Chunk Plan"
@@ -817,10 +821,20 @@ class Pipe:
         body: dict,
         __user__: Optional[dict] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[Any]]] = None,
+        __request__: Optional[Any] = None,
     ) -> str:
         v = self.valves
 
         async def status(msg: str, done: bool = False):
+            # doubles as the stop check between phases
+            if __request__ is not None and not done:
+                try:
+                    if await __request__.is_disconnected():
+                        raise StopRun()
+                except StopRun:
+                    raise
+                except Exception:
+                    pass  # older OpenWebUI without is_disconnected
             if __event_emitter__:
                 await __event_emitter__(
                     {"type": "status", "data": {"description": msg, "done": done}}
@@ -1048,6 +1062,11 @@ class Pipe:
                     smark,
                 ) + note
 
+        except StopRun:
+            return (
+                "⏹️ **Stopped at your request.**"
+                + self._footer(state, "Resend your last message to continue from where we left off.")
+            )
         except Exception as e:
             await status("Failed", done=True)
             return (

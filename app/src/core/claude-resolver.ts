@@ -135,15 +135,16 @@ export class ClaudeResolver implements IClaudeResolver {
     );
   }
 
-  async executeClaudeCommand(prompt: string, model: string): Promise<string> {
-    return this.executeClaudeCommandWithSession(prompt, model, null, false);
+  async executeClaudeCommand(prompt: string, model: string, signal?: AbortSignal): Promise<string> {
+    return this.executeClaudeCommandWithSession(prompt, model, null, false, signal);
   }
 
   async executeClaudeCommandWithSession(
-    prompt: string, 
-    model: string, 
-    sessionId: string | null, 
-    useJsonOutput: boolean
+    prompt: string,
+    model: string,
+    sessionId: string | null,
+    useJsonOutput: boolean,
+    signal?: AbortSignal
   ): Promise<string> {
     const claudeCmd = await this.findClaudeCommand();
     const config = EnvironmentManager.getConfig();
@@ -188,9 +189,11 @@ export class ClaudeResolver implements IClaudeResolver {
     });
     
     try {
+      // signal: aborting kills the CLI subprocess (client disconnected)
       const childPromise = execAsync(command, {
         maxBuffer: 1024 * 1024 * 10,
-        timeout: config.timeout
+        timeout: config.timeout,
+        ...(signal ? { signal } : {})
       });
       childPromise.child.stdin?.write(prompt);
       childPromise.child.stdin?.end();
@@ -204,12 +207,18 @@ export class ClaudeResolver implements IClaudeResolver {
       return stdout.trim();
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+
+      if (signal?.aborted) {
+        logger.warn('Claude CLI execution aborted (client disconnected)');
+        throw new ClaudeCliError('Claude CLI execution aborted by client disconnect');
+      }
+
       logger.error('Claude CLI execution failed', error as Error);
-      
+
       if (errorMessage.includes('timeout')) {
         throw new TimeoutError(`Claude CLI execution timed out after ${config.timeout}ms`);
       }
-      
+
       throw new ClaudeCliError(`Claude CLI execution failed: ${errorMessage}`);
     }
   }
