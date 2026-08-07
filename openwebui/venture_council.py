@@ -596,11 +596,11 @@ class Pipe:
             )
         return plan, fund, round_no, roster, reports
 
-    @staticmethod
-    def _synth_input(brief: str, roster: list, reports: dict) -> str:
+    @classmethod
+    def _synth_input(cls, brief: str, roster: list, reports: dict) -> str:
         parts = [f"# Venture Brief\n{brief}"]
         for eid, rep in reports.items():
-            parts.append(f"# Expert report: {eid}\n{rep}")
+            parts.append(f"# Expert report: {eid}\n{cls._unwrap_completion(rep)}")
         if roster:
             parts.append("# Spawned specialists\n" + "\n".join(
                 f"- {s['id']}: {s.get('title','')} — {s.get('why','')}" for s in roster))
@@ -617,8 +617,14 @@ class Pipe:
         out = f"{PLAN_HEADING} — round {rounds}, red team: **{verdict}**\n\n"
         out += self._roster_section(roster) + "\n\n" + plan + "\n"
         if self.valves.SHOW_INTERMEDIATE:
-            expert_secs = [self._collapsible(f"🔎 Expert report — {eid}", rep)
-                           for eid, rep in reports.items()]
+            # unwrap self-heals reports checkpointed while the wrapper was
+            # double-encoding responses
+            expert_secs = [
+                self._collapsible(f"🔎 Expert report — {eid}", self._unwrap_completion(rep))
+                for eid, rep in reports.items()
+            ]
+            sections = [self._unwrap_completion(s) if s.lstrip().startswith("{") else s
+                        for s in sections]
             out += f"\n---\n{RECORDS_HEADING}\n\n" + "\n".join(expert_secs + sections)
         out += self._footer(STATE_PLAN_REVIEW, self.GATE_TEXT, smark)
         return out
