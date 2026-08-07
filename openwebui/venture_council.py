@@ -432,9 +432,10 @@ class Pipe:
         return re.sub(r"[#*`\-\s]+", " ", first).strip()[:60] or "venture"
 
     GATE_TEXT = (
-        "🚦 Reply **approve** for the final package · feedback → rework loop · "
-        "**board: <answer>** to answer a Kill/Pursue question (branches collapse, numbers recompute) · "
-        "**board** / **plan** to re-show."
+        "🚦 **approve** → final package · **revise: <feedback>** → rework through the council · "
+        "**board: <answer>** → collapse a Kill/Pursue branch, numbers recompute · "
+        "**board** / **plan** → re-show · anything else (questions, docs, what-ifs) is answered "
+        "from the plan without re-running the council."
     )
     INTAKE_TEXT = (
         "💬 Answer, correct any assumption, or add facts (guesses are fine — they're labeled). "
@@ -656,6 +657,26 @@ class Pipe:
 
     # -- resume ---------------------------------------------------------------
 
+    async def _advise(self, session, status, cp: dict, user_msg: str,
+                      messages: list, state: str, footer_text: str, smark: str) -> str:
+        """Answer questions / generate docs / run what-ifs from the plan,
+        without re-running the council."""
+        v = self.valves
+        await status(f"💬 {v.STRATEGIST_MODEL} advising…")
+        context = (
+            f"# Venture Brief\n{cp.get('brief', '(not saved)')}\n\n"
+            f"# Business Plan\n{self._unwrap_completion(cp.get('plan', '(not saved)'))}\n\n"
+        )
+        if cp.get("final"):
+            context += f"# Final Package\n{self._unwrap_completion(cp['final'])}\n\n"
+        context += (
+            f"# Recent conversation\n{self._history(messages[-8:])}\n\n"
+            f"# Founder's request\n{user_msg}"
+        )
+        answer = await self._chat(session, v.STRATEGIST_MODEL, ADVISOR_SYSTEM, context)
+        await status("Done", done=True)
+        return answer + self._footer(state, footer_text, smark)
+
     async def _resume(self, session, sid: str) -> str:
         data = await self._load(session, sid)
         if not data:
@@ -757,6 +778,7 @@ class Pipe:
                         return board + self._footer(STATE_PLAN_REVIEW, self.GATE_TEXT, smark)
 
                     board_answer = BOARD_ANSWER_RE.match(user_msg)
+                    revise = REVISE_RE.match(user_msg)
                     if board_answer:
                         findings = (
                             "The founder answered a Kill/Pursue Board question with real-world "
@@ -764,8 +786,14 @@ class Pipe:
                             "affected branches, recompute financials/roadmap from the model "
                             "inputs, resolve the question on the board, and append to the "
                             "Decision Log.")
+                    elif revise:
+                        findings = f"### Founder feedback\n{revise.group(1).strip()}"
                     elif not approved:
-                        findings = f"### Founder feedback\n{user_msg}"
+                        # questions / doc requests / what-ifs — never re-run the
+                        # council by accident
+                        return await self._advise(session, status, cp, user_msg,
+                                                  messages, STATE_PLAN_REVIEW,
+                                                  self.GATE_TEXT, smark)
                     else:
                         # approved -> final package
                         await status(f"🚀 {v.STRATEGIST_MODEL} producing the final package…")
@@ -803,18 +831,9 @@ class Pipe:
 
                 if not new_v:
                     # advisor mode: Q&A, docs, what-ifs — grounded in the plan
-                    await status(f"💬 {v.STRATEGIST_MODEL} advising…")
                     cp = await self._load(session, sid)
-                    context = (
-                        f"# Venture Brief\n{cp.get('brief', '(not saved)')}\n\n"
-                        f"# Business Plan\n{self._unwrap_completion(cp.get('plan', '(not saved)'))}\n\n"
-                        f"# Final Package\n{self._unwrap_completion(cp.get('final', '(not saved)'))}\n\n"
-                        f"# Recent conversation\n{self._history(messages[-8:])}\n\n"
-                        f"# Founder's request\n{user_msg}"
-                    )
-                    answer = await self._chat(session, v.STRATEGIST_MODEL, ADVISOR_SYSTEM, context)
-                    await status("Done", done=True)
-                    return answer + self._footer(STATE_DONE, self.DONE_TEXT, smark)
+                    return await self._advise(session, status, cp, user_msg,
+                                              messages, STATE_DONE, self.DONE_TEXT, smark)
 
                 # explicit new venture → fresh cycle, fresh checkpoint
                 await status(f"🧠 {v.INTERVIEW_MODEL} starting the next cycle…")
