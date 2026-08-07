@@ -161,21 +161,22 @@ export class ClaudeResolver implements IClaudeResolver {
       flags += ` --output-format json`;
     }
     
+    // The prompt is piped via stdin (see below) instead of being embedded in
+    // the command line with echo: large prompts exceed Windows' ~32K
+    // CreateProcess command-line limit (spawn ENAMETOOLONG).
     let command: string;
-    
+
     // Handle Docker commands
     if (claudeCmd.includes('docker run') || claudeCmd.includes('podman run')) {
-      // For Docker, we need to modify the container command
-      const dockerCommand = claudeCmd + ` ${flags}`;
-      command = `echo '${this.escapeShellString(prompt)}' | ${dockerCommand}`;
+      command = `${claudeCmd} ${flags}`;
     }
     // Handle bash -c wrapped commands
     else if (claudeCmd.includes('bash -c')) {
-      command = `echo '${this.escapeShellString(prompt)}' | ${claudeCmd.replace('"claude"', `"claude ${flags}"`)}`;
+      command = claudeCmd.replace('"claude"', `"claude ${flags}"`);
     }
     // Handle regular commands
     else {
-      command = `echo '${this.escapeShellString(prompt)}' | ${claudeCmd} ${flags}`;
+      command = `${claudeCmd} ${flags}`;
     }
 
     logger.debug('Executing Claude command with session', { 
@@ -187,11 +188,14 @@ export class ClaudeResolver implements IClaudeResolver {
     });
     
     try {
-      const { stdout, stderr } = await execAsync(command, { 
+      const childPromise = execAsync(command, {
         maxBuffer: 1024 * 1024 * 10,
         timeout: config.timeout
       });
-      
+      childPromise.child.stdin?.write(prompt);
+      childPromise.child.stdin?.end();
+      const { stdout, stderr } = await childPromise;
+
       if (stderr && stderr.trim()) {
         logger.warn('Claude CLI warning', { stderr: stderr.trim() });
       }
