@@ -101,6 +101,15 @@ REVISE_RE = re.compile(r"^\s*(?:revise|rework)\s*:\s*(.+)$", re.IGNORECASE | re.
 # builds. Requiring the ### prefix keeps a founder's "Task: ..." out of it.
 TASK_RE = re.compile(r"^\s*#{1,4}\s*Task:\s", re.IGNORECASE)
 
+DOCS_HEADING = "# 📎 Founder-supplied source material"
+DOCS_PREAMBLE = (
+    "Verbatim documents the founder attached to this venture. They outrank your "
+    "own assumptions. A claim traceable to one of these documents is a [fact] "
+    "with the filename as its source — do not downgrade it to [estimate]. Where "
+    "a document contradicts something you would otherwise assume, say so "
+    "explicitly and follow the document."
+)
+
 BRIEF_HEADING = "# 📄 Venture Brief"
 PLAN_HEADING = "# 📊 Business Plan"
 RECORDS_HEADING = "# 📋 Council Records"
@@ -397,6 +406,10 @@ class Pipe:
             default=True, description="Expert reports and stress rounds as collapsible sections."
         )
         HISTORY_CHAR_BUDGET: int = Field(default=60000, description="Max history characters passed to models.")
+        MAX_DOC_CHARS: int = Field(
+            default=40000,
+            description="Max characters of attached documents passed verbatim to every agent, across all files.",
+        )
         MAX_PROMPT_CHARS: int = Field(
             default=200000,
             description="Hard cap per model prompt; oversized prompts are middle-truncated (protects wrapper body limits and latency).",
@@ -488,6 +501,68 @@ class Pipe:
         if isinstance(content, list):
             return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
         return content or ""
+
+    @staticmethod
+    def _doc_entries(files) -> list:
+        """Flatten OpenWebUI's body['files'] into [(name, text)].
+
+        The layout differs between versions and between a single upload and a
+        knowledge collection, so this probes the known places rather than
+        assuming one shape. Entries without extracted text are skipped.
+        """
+        found = []
+
+        def take(node):
+            if not isinstance(node, dict):
+                return
+            data = node.get("data")
+            text = data.get("content") if isinstance(data, dict) else None
+            text = text or node.get("content") or ""
+            if not isinstance(text, str) or not text.strip():
+                return
+            meta = node.get("meta") if isinstance(node.get("meta"), dict) else {}
+            name = (node.get("filename") or node.get("name")
+                    or meta.get("name") or "attachment")
+            found.append((str(name), text))
+
+        for entry in files or []:
+            if not isinstance(entry, dict):
+                continue
+            take(entry)
+            take(entry.get("file"))
+            container = entry.get("collection")
+            container = container if isinstance(container, dict) else entry
+            for f in container.get("files") or []:
+                take(f)
+                if isinstance(f, dict):
+                    take(f.get("file"))
+
+        seen, uniq = set(), []
+        for name, text in found:
+            key = (name, len(text), text[:200])
+            if key not in seen:
+                seen.add(key)
+                uniq.append((name, text))
+        return uniq
+
+    def _source_docs(self, body: dict) -> str:
+        """Attached documents as one prompt block, bounded by MAX_DOC_CHARS."""
+        docs = self._doc_entries(body.get("files"))
+        if not docs:
+            return ""
+        budget = self.valves.MAX_DOC_CHARS
+        parts = []
+        for i, (name, text) in enumerate(docs):
+            if budget <= 0:
+                parts.append(f"*[{len(docs) - i} further attachment(s) omitted — "
+                             f"MAX_DOC_CHARS reached]*")
+                break
+            chunk = text[:budget]
+            budget -= len(chunk)
+            if len(chunk) < len(text):
+                chunk += f"\n\n*[... {name} truncated at MAX_DOC_CHARS ...]*"
+            parts.append(f"## {name}\n{chunk}")
+        return f"{DOCS_HEADING}\n{DOCS_PREAMBLE}\n\n" + "\n\n".join(parts)
 
     def _scan_marker(self, messages, regex) -> Optional[str]:
         for m in reversed(messages):
@@ -619,7 +694,7 @@ class Pipe:
 
     async def _run_experts(self, session, status, brief: str, roster: list,
                            expert_ids: Optional[list] = None,
-                           findings: str = "") -> dict:
+                           findings: str = "", docs: str = "") -> dict:
         """Run core + spawned experts (all or a rerun subset). Returns id->report."""
         v = self.valves
         prompts = dict(self._core_prompts())
@@ -627,6 +702,8 @@ class Pipe:
             prompts[s["id"]] = s.get("charter", "You are a specialist. Analyze the venture.")
         ids = [i for i in (expert_ids or list(prompts)) if i in prompts]
         user = f"# Venture Brief\n{brief}"
+        if docs:
+            user += f"\n\n{docs}"
         if findings:
             user += f"\n\n# Red-team findings to address in your area\n{findings}"
 
@@ -650,7 +727,8 @@ class Pipe:
         return reports
 
     async def _stress_loop(self, session, status, brief: str, plan: str,
-                           roster: list, reports: dict, sections: list):
+                           roster: list, reports: dict, sections: list,
+                           docs: str = ""):
         """Red team -> triage -> targeted rerun -> resynthesis, until FUND or cap.
         Returns (plan, fund, rounds_used, roster, reports)."""
         v = self.valves
@@ -659,6 +737,8 @@ class Pipe:
             roles = " + ".join(p for p, _, _ in REDTEAM_PERSONAS)
             await status(f"🥊 Stress round {round_no}/{v.MAX_STRESS_ROUNDS}: {roles}…")
             target = f"# Venture Brief\n{brief}\n\n# Business Plan\n{plan}"
+            if docs:
+                target += f"\n\n{docs}"
             critiques = []
             for persona, prompt, token in REDTEAM_PERSONAS:
                 try:
@@ -701,19 +781,22 @@ class Pipe:
             if rerun:
                 await status(f"✏️ reworking: {', '.join(rerun)}…")
                 reports.update(await self._run_experts(
-                    session, status, brief, roster, expert_ids=rerun, findings=findings))
+                    session, status, brief, roster, expert_ids=rerun,
+                    findings=findings, docs=docs))
 
             await status(f"🧮 {v.STRATEGIST_MODEL} revising the plan…")
             plan = await self._chat(
                 session, v.STRATEGIST_MODEL, RESYNTH_SYSTEM,
-                self._synth_input(brief, roster, reports)
+                self._synth_input(brief, roster, reports, docs)
                 + f"\n\n# Red-team findings to address\n{findings}\n\n# Previous plan\n{plan}",
             )
         return plan, fund, round_no, roster, reports
 
     @classmethod
-    def _synth_input(cls, brief: str, roster: list, reports: dict) -> str:
+    def _synth_input(cls, brief: str, roster: list, reports: dict, docs: str = "") -> str:
         parts = [f"# Venture Brief\n{brief}"]
+        if docs:
+            parts.append(docs)
         for eid, rep in reports.items():
             parts.append(f"# Expert report: {eid}\n{cls._unwrap_completion(rep)}")
         if roster:
@@ -746,7 +829,8 @@ class Pipe:
         return out
 
     async def _full_run(self, session, status, sid, smark, brief, sections=None,
-                        roster=None, reports=None, findings: str = ""):
+                        roster=None, reports=None, findings: str = "",
+                        docs: str = ""):
         """Roster -> experts -> synthesis -> stress loop -> plan message."""
         v = self.valves
         sections = sections if sections is not None else []
@@ -754,14 +838,15 @@ class Pipe:
             await status(f"🧩 {v.STRATEGIST_MODEL} designing the council…")
             roster = await self._design_roster(session, brief)
         if reports is None:
-            reports = await self._run_experts(session, status, brief, roster, findings=findings)
+            reports = await self._run_experts(session, status, brief, roster,
+                                              findings=findings, docs=docs)
         await status(f"🧮 {v.STRATEGIST_MODEL} synthesizing the plan…")
-        synth_user = self._synth_input(brief, roster, reports)
+        synth_user = self._synth_input(brief, roster, reports, docs)
         if findings:
             synth_user += f"\n\n# Address these findings\n{findings}"
         plan = await self._chat(session, v.STRATEGIST_MODEL, SYNTHESIS_SYSTEM, synth_user)
         plan, fund, rounds, roster, reports = await self._stress_loop(
-            session, status, brief, plan, roster, reports, sections)
+            session, status, brief, plan, roster, reports, sections, docs)
         note = await self._save(
             session, sid, STATE_PLAN_REVIEW, pipe="venture-council",
             name=self._name_from(brief), brief=brief, plan=plan,
@@ -773,7 +858,8 @@ class Pipe:
     # -- resume ---------------------------------------------------------------
 
     async def _advise(self, session, status, cp: dict, user_msg: str,
-                      messages: list, state: str, footer_text: str, smark: str) -> str:
+                      messages: list, state: str, footer_text: str, smark: str,
+                      docs: str = "") -> str:
         """Answer questions / generate docs / run what-ifs from the plan,
         without re-running the council."""
         v = self.valves
@@ -784,6 +870,8 @@ class Pipe:
         )
         if cp.get("final"):
             context += f"# Final Package\n{self._unwrap_completion(cp['final'])}\n\n"
+        if docs:
+            context += f"{docs}\n\n"
         context += (
             f"# Recent conversation\n{self._history(messages[-8:])}\n\n"
             f"# Founder's request\n{user_msg}"
@@ -845,6 +933,9 @@ class Pipe:
         existing_sid = self._scan_marker(messages, SESSION_RE)
         sid = existing_sid or uuid.uuid4().hex[:8]
         smark = SESSION_MARKER.format(session=sid)
+        # attachments travel with the request, so they must be re-attached in
+        # OpenWebUI for a rework turn to see them; nothing is checkpointed
+        docs = self._source_docs(body)
 
         if not user_msg.strip():
             return ("Tell me about your startup idea — whatever you know. Facts, guesses, "
@@ -875,7 +966,8 @@ class Pipe:
                     await status(f"🧠 {v.INTERVIEW_MODEL} drafting the venture brief…")
                     draft = await self._chat(
                         session, v.INTERVIEW_MODEL, INTAKE_SYSTEM,
-                        f"# Conversation so far\n{self._history(messages)}")
+                        f"# Conversation so far\n{self._history(messages)}"
+                        + (f"\n\n{docs}" if docs else ""))
                     extra = {} if existing_sid else {"name": self._name_from(user_msg)}
                     note = await self._save(session, sid, STATE_INTAKE,
                                             pipe="venture-council", draft=draft, **extra)
@@ -887,8 +979,10 @@ class Pipe:
                     await status(f"📄 {v.INTERVIEW_MODEL} locking the brief…")
                     brief = await self._chat(
                         session, v.INTERVIEW_MODEL, BRIEF_FINALIZE_SYSTEM,
-                        f"# Conversation so far\n{self._history(messages)}")
-                    return await self._full_run(session, status, sid, smark, brief)
+                        f"# Conversation so far\n{self._history(messages)}"
+                        + (f"\n\n{docs}" if docs else ""))
+                    return await self._full_run(session, status, sid, smark, brief,
+                                                docs=docs)
 
                 # ---- PLAN GATE ----
                 if state == STATE_PLAN_REVIEW:
@@ -928,13 +1022,14 @@ class Pipe:
                         # council by accident
                         return await self._advise(session, status, cp, user_msg,
                                                   messages, STATE_PLAN_REVIEW,
-                                                  self.GATE_TEXT, smark)
+                                                  self.GATE_TEXT, smark, docs)
                     else:
                         # approved -> final package
                         await status(f"🚀 {v.STRATEGIST_MODEL} producing the final package…")
                         final = await self._chat(
                             session, v.STRATEGIST_MODEL, FINAL_SYSTEM,
-                            f"# Venture Brief\n{brief}\n\n# Approved Plan\n{plan}")
+                            f"# Venture Brief\n{brief}\n\n# Approved Plan\n{plan}"
+                            + (f"\n\n{docs}" if docs else ""))
                         note = await self._save(session, sid, STATE_DONE,
                                                 pipe="venture-council", final=final)
                         await status("Done", done=True)
@@ -946,7 +1041,7 @@ class Pipe:
                     await status(f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
                     return await self._full_run(
                         session, status, sid, smark, brief,
-                        roster=roster, reports=reports, findings=findings)
+                        roster=roster, reports=reports, findings=findings, docs=docs)
 
                 # ---- DONE: advise / revise / new venture ----
                 new_v = NEW_VENTURE_RE.match(user_msg)
@@ -961,14 +1056,16 @@ class Pipe:
                         return await self._full_run(
                             session, status, sid, smark, brief,
                             roster=cp.get("roster", []), reports=cp.get("reports", {}),
-                            findings=f"### Founder feedback after delivery\n{revise.group(1).strip()}")
+                            findings=f"### Founder feedback after delivery\n{revise.group(1).strip()}",
+                            docs=docs)
                     # checkpoint incomplete → fall through to advisor
 
                 if not new_v:
                     # advisor mode: Q&A, docs, what-ifs — grounded in the plan
                     cp = await self._load(session, sid)
                     return await self._advise(session, status, cp, user_msg,
-                                              messages, STATE_DONE, self.DONE_TEXT, smark)
+                                              messages, STATE_DONE, self.DONE_TEXT,
+                                              smark, docs)
 
                 # explicit new venture → fresh cycle, fresh checkpoint
                 await status(f"🧠 {v.INTERVIEW_MODEL} starting the next cycle…")
@@ -976,7 +1073,8 @@ class Pipe:
                 draft = await self._chat(
                     session, v.INTERVIEW_MODEL, INTAKE_SYSTEM,
                     f"# Conversation so far (includes the previous venture/plan)\n{self._history(messages)}"
-                    f"\n\n# New venture idea\n{idea}")
+                    f"\n\n# New venture idea\n{idea}"
+                    + (f"\n\n{docs}" if docs else ""))
                 sid = uuid.uuid4().hex[:8]
                 smark = SESSION_MARKER.format(session=sid)
                 note = await self._save(session, sid, STATE_INTAKE, pipe="venture-council",

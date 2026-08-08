@@ -20,6 +20,15 @@ to affected experts (spawning new specialists if needed) until all three clear
 or the round cap → your plan gate → investor one-pager + 2-week validation
 sprint with pre-committed decision rules + decision log.
 
+**Source documents.** Attach files to the message (the 📎 in OpenWebUI) and
+their full text is passed verbatim to the brief, every expert, the
+synthesizer and all three red-team personas, with instructions to treat what
+they contain as `[fact]` sourced to the filename rather than `[estimate]`.
+Total is capped by `MAX_DOC_CHARS` (40,000). Attachments ride with the
+request, so re-attach them on a rework turn if you want that round to see
+them. Do **not** use a knowledge collection for this — OpenWebUI's retrieval
+rewraps your message and breaks the `approve` / `revise:` / `board:` gates.
+
 At the plan gate: **approve**, plain feedback (goes through the rework loop),
 `board: <answer>` (collapses that question's branches and recomputes),
 `board` / `plan` (re-show). `sessions` / `resume <id>` work via the
