@@ -10,6 +10,10 @@ build/
 app/dist/
 *.tsbuildinfo
 
+# Python bytecode (openwebui/ pipes, coordinator, worker)
+__pycache__/
+*.py[cod]
+
 # Environment variables
 .env
 .env.local
