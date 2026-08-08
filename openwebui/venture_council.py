@@ -92,6 +92,7 @@ def _is_housekeeping(task, text: str) -> bool:
 REVISIONS_RE = re.compile(r"^\s*(?:revisions|versions|history)\s*$", re.IGNORECASE)
 REVISION_SHOW_RE = re.compile(r"^\s*(?:revision|version|v)\s*#?\s*(\d+)\s*$", re.IGNORECASE)
 KEEP_RE = re.compile(r"^\s*(?:keep|restore|use)\s*#?\s*(\d+)\s*$", re.IGNORECASE)
+EXPORT_RE = re.compile(r"^\s*(?:export|save)(?:\s*#?\s*(\d+|all))?\s*$", re.IGNORECASE)
 DIFF_RE = re.compile(
     r"^\s*(?:diff|compare)(?:\s*#?\s*(\d+))?(?:\s*(?:vs\.?|to|and|\.\.)?\s*#?\s*(\d+))?\s*$",
     re.IGNORECASE,
@@ -432,9 +433,9 @@ class Pipe:
             default=True, description="Expert reports and stress rounds as collapsible sections."
         )
         HISTORY_CHAR_BUDGET: int = Field(default=60000, description="Max history characters passed to models.")
-        EXPORT_ARTIFACTS: bool = Field(
-            default=True,
-            description="Write each plan version to disk via the coordinator (start it with --artifacts DIR). One folder per revision.",
+        AUTO_EXPORT: bool = Field(
+            default=False,
+            description="Write every synthesis to disk automatically. Off by default — reply `export` to save a version when you want it (needs the coordinator started with --artifacts DIR).",
         )
         MAX_REVISIONS: int = Field(
             default=10,
@@ -588,9 +589,41 @@ class Pipe:
                 uniq.append((name, text))
         return uniq
 
+    async def _merged_docs(self, session, sid: str, body: dict):
+        """Documents for this turn: whatever is attached now, merged over what
+        the venture already had. Attachments ride with a single request, so
+        without this a doc only ever reached the turn it was attached to.
+        Returns (rendered block, entries to checkpoint)."""
+        fresh = self._doc_entries(body.get("files"))
+        stored = []
+        try:
+            saved = (await self._load(session, sid)).get("doc_files") or []
+            stored = [(d[0], d[1]) for d in saved
+                      if isinstance(d, (list, tuple)) and len(d) == 2]
+        except Exception:
+            stored = []
+        merged, seen = [], set()
+        for name, text in fresh + stored:      # a re-attached file wins
+            if name not in seen:
+                seen.add(name)
+                merged.append((name, text))
+        merged = self._cap_entries(merged)
+        return self._render_docs(merged), merged
+
+    def _cap_entries(self, entries: list) -> list:
+        budget, out = self.valves.MAX_DOC_CHARS, []
+        for name, text in entries:
+            if budget <= 0:
+                break
+            out.append((name, text[:budget]))
+            budget -= min(len(text), budget)
+        return out
+
     def _source_docs(self, body: dict) -> str:
         """Attached documents as one prompt block, bounded by MAX_DOC_CHARS."""
-        docs = self._doc_entries(body.get("files"))
+        return self._render_docs(self._doc_entries(body.get("files")))
+
+    def _render_docs(self, docs: list) -> str:
         if not docs:
             return ""
         budget = self.valves.MAX_DOC_CHARS
@@ -665,8 +698,9 @@ class Pipe:
     GATE_TEXT = (
         "🚦 **approve** → final package · **revise: <feedback>** → rework through the council · "
         "**board: <answer>** → collapse a Kill/Pursue branch, numbers recompute · "
-        "**board** / **plan** → re-show · **revisions** → version history, **diff** → what "
-        "changed, **keep <n>** → restore a version · anything else (questions, docs, what-ifs) "
+        "**board** / **plan** → re-show · **revisions** / **diff** / **keep <n>** for version "
+        "history · **export** (or **export 2** / **export all**) writes to disk · "
+        "anything else (questions, docs, what-ifs) "
         "is answered from the plan without re-running the council."
     )
     INTAKE_TEXT = (
@@ -676,7 +710,7 @@ class Pipe:
     DONE_TEXT = (
         "💬 Ask anything or request docs (pitch deck, exec summary, investor email, what-ifs…) — "
         "I'll answer from the plan · **revise: <feedback>** reworks the plan through the council · "
-        "**revisions** / **diff** / **keep <n>** for version history · "
+        "**revisions** / **diff** / **keep <n>** / **export** for versions and files · "
         "**new venture: <idea>** starts the next cycle."
     )
 
@@ -695,8 +729,6 @@ class Pipe:
                       tldr: str, reports: dict, docs_note: str = "") -> str:
         """Write this version to disk via the coordinator (a host process — the
         pipe itself is inside the container). Never fails the run."""
-        if not self.valves.EXPORT_ARTIFACTS:
-            return ""
         files = {"plan.md": plan, "brief.md": brief}
         if tldr:
             files["tldr.md"] = tldr
@@ -857,6 +889,32 @@ class Pipe:
             return (f"✅ **v{r['n']} is now the current plan** (saved as "
                     f"v{restored[-1]['n']}). Later work revises from here."
                     + self._footer(state, ftext, smark) + note)
+
+        export = EXPORT_RE.match(user_msg)
+        if export:
+            if not revs:
+                return ("Nothing to export yet — the council hasn't produced a plan."
+                        + self._footer(state, ftext, smark))
+            which = (export.group(1) or "").lower()
+            if which == "all":
+                targets = revs
+            elif which:
+                one = self._find_revision(revs, int(which))
+                if not one:
+                    return (f"No version {which}. Reply **revisions** to list them."
+                            + self._footer(state, ftext, smark))
+                targets = [one]
+            else:
+                targets = [revs[-1]]
+            name = cp.get("name") or "venture"
+            brief = cp.get("brief", "")
+            reports = cp.get("reports", {})
+            lines = []
+            for r in targets:
+                lines.append(await self._export(
+                    session, name, r["n"], brief, r.get("plan", ""),
+                    r.get("tldr", ""), reports))
+            return ("".join(lines) or "Nothing written.") + self._footer(state, ftext, smark)
 
         diff = DIFF_RE.match(user_msg)
         if diff:
@@ -1065,7 +1123,7 @@ class Pipe:
     async def _full_run(self, session, status, sid, smark, brief, sections=None,
                         roster=None, reports=None, findings: str = "",
                         docs: str = "", prior_plan: str = "", revisions=None,
-                        why: str = ""):
+                        why: str = "", doc_files=None):
         """Roster -> experts -> synthesis -> stress loop -> plan message."""
         v = self.valves
         sections = sections if sections is not None else []
@@ -1103,10 +1161,14 @@ class Pipe:
             session, sid, STATE_PLAN_REVIEW, pipe="venture-council",
             name=vname, brief=brief, plan=plan,
             roster=roster, reports=reports, fund=fund, rounds=rounds,
-            revisions=revisions, tldr=tldr,
+            revisions=revisions, tldr=tldr, doc_files=doc_files or [],
         )
-        artifacts = await self._export(session, vname, revisions[-1]["n"],
-                                       brief, plan, tldr, reports)
+        if v.AUTO_EXPORT:
+            artifacts = await self._export(session, vname, revisions[-1]["n"],
+                                           brief, plan, tldr, reports)
+        else:
+            artifacts = (f"\n📁 *Reply* **export** *to write v{revisions[-1]['n']} "
+                         "to disk (plan, TL;DR, brief, board, expert reports).*\n")
         await status("Plan ready — your gate", done=True)
         return self._plan_message(plan, fund, rounds, roster, reports, sections, smark,
                                   tldr=tldr, version=revisions[-1]["n"],
@@ -1193,9 +1255,6 @@ class Pipe:
         existing_sid = self._scan_marker(messages, SESSION_RE)
         sid = existing_sid or uuid.uuid4().hex[:8]
         smark = SESSION_MARKER.format(session=sid)
-        # attachments travel with the request, so they must be re-attached in
-        # OpenWebUI for a rework turn to see them; nothing is checkpointed
-        docs = self._source_docs(body)
 
         if not user_msg.strip():
             return ("Tell me about your startup idea — whatever you know. Facts, guesses, "
@@ -1221,6 +1280,9 @@ class Pipe:
                     await status(f"🔁 Resuming {resume.group(1)}…", done=True)
                     return await self._resume(session, resume.group(1))
 
+                # documents attached on any earlier turn stay with the venture
+                docs, doc_files = await self._merged_docs(session, sid, body)
+
                 # ---- INTAKE: interview toward the Venture Brief ----
                 if state == STATE_INTAKE and not approved:
                     await status(f"🧠 {v.INTERVIEW_MODEL} drafting the venture brief…")
@@ -1230,7 +1292,8 @@ class Pipe:
                         + (f"\n\n{docs}" if docs else ""))
                     extra = {} if existing_sid else {"name": self._name_from(user_msg)}
                     note = await self._save(session, sid, STATE_INTAKE,
-                                            pipe="venture-council", draft=draft, **extra)
+                                            pipe="venture-council", draft=draft,
+                                            doc_files=doc_files, **extra)
                     await status("Done", done=True)
                     return draft + self._footer(STATE_INTAKE, self.INTAKE_TEXT, smark) + note
 
@@ -1242,7 +1305,7 @@ class Pipe:
                         f"# Conversation so far\n{self._history(messages)}"
                         + (f"\n\n{docs}" if docs else ""))
                     return await self._full_run(session, status, sid, smark, brief,
-                                                docs=docs)
+                                                docs=docs, doc_files=doc_files)
 
                 # ---- PLAN GATE ----
                 if state == STATE_PLAN_REVIEW:
@@ -1314,7 +1377,8 @@ class Pipe:
                     return await self._full_run(
                         session, status, sid, smark, brief,
                         roster=roster, reports=reports, findings=findings, docs=docs,
-                        prior_plan=plan, revisions=revs, why=why)
+                        prior_plan=plan, revisions=revs, why=why,
+                        doc_files=doc_files)
 
                 # ---- DONE: advise / revise / new venture ----
                 new_v = NEW_VENTURE_RE.match(user_msg)
@@ -1331,7 +1395,8 @@ class Pipe:
                             roster=cp.get("roster", []), reports=cp.get("reports", {}),
                             findings=f"### Founder feedback after delivery\n{revise.group(1).strip()}",
                             docs=docs, prior_plan=plan, revisions=self._revisions(cp),
-                            why=f"revise: {revise.group(1).strip()[:60]}")
+                            why=f"revise: {revise.group(1).strip()[:60]}",
+                            doc_files=doc_files)
                     # checkpoint incomplete → fall through to advisor
 
                 if not new_v:
