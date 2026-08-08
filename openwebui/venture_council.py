@@ -432,6 +432,10 @@ class Pipe:
             default=True, description="Expert reports and stress rounds as collapsible sections."
         )
         HISTORY_CHAR_BUDGET: int = Field(default=60000, description="Max history characters passed to models.")
+        EXPORT_ARTIFACTS: bool = Field(
+            default=True,
+            description="Write each plan version to disk via the coordinator (start it with --artifacts DIR). One folder per revision.",
+        )
         MAX_REVISIONS: int = Field(
             default=10,
             description="Plan versions kept for `revisions` / `diff` / `keep`. Oldest beyond this are dropped; v1 is always kept.",
@@ -686,6 +690,29 @@ class Pipe:
         except Exception as e:
             return (f"\n\n⚠️ *Checkpoint not saved (coordinator unreachable: {e}) — "
                     "not resumable if this chat is lost.*")
+
+    async def _export(self, session, name: str, version: int, brief: str, plan: str,
+                      tldr: str, reports: dict, docs_note: str = "") -> str:
+        """Write this version to disk via the coordinator (a host process — the
+        pipe itself is inside the container). Never fails the run."""
+        if not self.valves.EXPORT_ARTIFACTS:
+            return ""
+        files = {"plan.md": plan, "brief.md": brief}
+        if tldr:
+            files["tldr.md"] = tldr
+        start = plan.rfind(BOARD_HEADING)
+        if start != -1:
+            files["kill-pursue-board.md"] = plan[start:].split("\n## ")[0]
+        for eid, rep in (reports or {}).items():
+            files[f"expert-{eid}.md"] = self._unwrap_completion(rep)
+        try:
+            res = await self._coord(session, "POST", "/artifacts", {
+                "name": name, "version": version, "files": files})
+            folder = res.get("folder", "")
+            return (f"\n📁 *Saved {len(res.get('written', []))} files to* `{folder}`\n"
+                    if folder else "")
+        except Exception as e:
+            return f"\n⚠️ *Export failed ({e}) — the plan above is still checkpointed.*\n"
 
     async def _load(self, session, sid: str) -> dict:
         try:
@@ -1071,15 +1098,19 @@ class Pipe:
             tldr = ""  # a missing summary must never lose the plan
         revisions = self._append_revision(
             revisions or [], plan, why or "initial plan", fund, rounds, tldr)
+        vname = self._name_from(brief)
         note = await self._save(
             session, sid, STATE_PLAN_REVIEW, pipe="venture-council",
-            name=self._name_from(brief), brief=brief, plan=plan,
+            name=vname, brief=brief, plan=plan,
             roster=roster, reports=reports, fund=fund, rounds=rounds,
             revisions=revisions, tldr=tldr,
         )
+        artifacts = await self._export(session, vname, revisions[-1]["n"],
+                                       brief, plan, tldr, reports)
         await status("Plan ready — your gate", done=True)
         return self._plan_message(plan, fund, rounds, roster, reports, sections, smark,
-                                  tldr=tldr, version=revisions[-1]["n"]) + note
+                                  tldr=tldr, version=revisions[-1]["n"],
+                                  artifacts=artifacts) + note
 
     # -- resume ---------------------------------------------------------------
 
