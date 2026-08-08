@@ -94,6 +94,8 @@ REVISIONS_RE = re.compile(r"^\s*(?:revisions|versions|history)\s*$", re.IGNORECA
 REVISION_SHOW_RE = re.compile(r"^\s*(?:revision|version|v)\s*#?\s*(\d+)\s*$", re.IGNORECASE)
 KEEP_RE = re.compile(r"^\s*(?:keep|restore|use)\s*#?\s*(\d+)\s*$", re.IGNORECASE)
 EXPORT_RE = re.compile(r"^\s*(?:export|save)(?:\s*#?\s*(\d+|all))?\s*$", re.IGNORECASE)
+RECOVER_RE = re.compile(r"^\s*(?:recover|rebuild|import)(?:\s+(?:history|revisions))?\s*$",
+                        re.IGNORECASE)
 DIFF_RE = re.compile(
     r"^\s*(?:diff|compare)(?:\s*#?\s*(\d+))?(?:\s*(?:vs\.?|to|and|\.\.)?\s*#?\s*(\d+))?\s*$",
     re.IGNORECASE,
@@ -904,6 +906,50 @@ class Pipe:
             + self._footer(state, ftext, smark)
         )
 
+    @classmethod
+    def _plan_body(cls, content: str) -> str:
+        """Pull the plan out of a rendered plan message, in either layout: the
+        current one folds it into a <details>, the older one printed it inline
+        between the roster and the council records."""
+        m = re.search(r"<summary>[^<]*Full business plan.*?</summary>(.*?)</details>",
+                      content, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        body = re.split(r"\n---\n#\s*📋", content)[0]
+        body = re.split(r"\n\n---\n>\s", body)[0]
+        body = re.sub(r"^#\s*📊[^\n]*\n+", "", body)
+        body = re.sub(r"^##\s*Council Roster\n(?:[-*][^\n]*\n)+\n*", "", body)
+        return body.strip()
+
+    @classmethod
+    def _recover_revisions(cls, messages: list) -> list:
+        """Rebuild version history from the conversation. Plans produced before
+        versioning existed were only ever written to the checkpoint's single
+        `plan` field, each overwriting the last — but every one of them is still
+        sitting in the chat as a rendered message."""
+        out, pending = [], "initial plan"
+        for m in messages:
+            content = cls._content_str(m.get("content"))
+            if m.get("role") == "user":
+                rev, board = REVISE_RE.match(content), BOARD_ANSWER_RE.match(content)
+                if rev:
+                    pending = f"revise: {rev.group(1).strip()[:60]}"
+                elif board:
+                    pending = f"board: {board.group(1).strip()[:60]}"
+                continue
+            if m.get("role") != "assistant" or PLAN_HEADING not in content[:400]:
+                continue
+            plan = cls._plan_body(content)
+            if len(plan) < 200:          # a stub or an error message, not a plan
+                continue
+            head = content[:400]
+            fund = "CLEARED" in head or bool(re.search(r"red team:\s*\*\*FUND", head))
+            rounds = int(m2.group(1)) if (m2 := re.search(r"round (\d+)", head)) else 1
+            out.append({"n": len(out) + 1, "why": pending, "plan": plan,
+                        "fund": fund, "rounds": rounds, "tldr": "", "at": None})
+            pending = "revision"
+        return out
+
     @staticmethod
     def _when(ts) -> str:
         if not isinstance(ts, (int, float)) or ts <= 0:
@@ -918,8 +964,10 @@ class Pipe:
         m = re.search(r"\*\*Verdict\*\*[\s—:-]*(.+?)(?:\*\*|$)", tldr, re.IGNORECASE)
         line = m.group(1) if m else ""
         if not line:
-            m = re.search(r"(ARR[^|\n]{0,40})", rev.get("plan", ""), re.IGNORECASE)
-            line = m.group(1) if m else ""
+            # No TL;DR — a recovered version, say. A headline money figure beats
+            # an arbitrary sentence that happens to contain the letters ARR.
+            m = re.search(r"ARR[^.\n]{0,60}?(\$\d[\d,.]*\s*[kKmMbB]?)", rev.get("plan", ""))
+            line = f"ARR {m.group(1)}" if m else ""
         line = re.sub(r"\s+", " ", line).strip(" .—-*")
         return (line[:70] + "…") if len(line) > 70 else (line or "—")
 
@@ -966,7 +1014,8 @@ class Pipe:
             out.append("*The two versions are textually identical.*")
         return "\n".join(out) + self._footer(state, ftext, smark)
 
-    async def _version_command(self, session, sid, user_msg, cp, revs, smark, state):
+    async def _version_command(self, session, sid, user_msg, cp, revs, smark, state,
+                               messages=None):
         """Handle revisions / revision N / diff / keep N. None = not a version
         command, so the caller carries on with its normal gate handling."""
         ftext = self.GATE_TEXT if state == STATE_PLAN_REVIEW else self.DONE_TEXT
@@ -996,6 +1045,31 @@ class Pipe:
                                     rounds=r.get("rounds", 1), revisions=restored)
             return (f"✅ **v{r['n']} is now the current plan** (saved as "
                     f"v{restored[-1]['n']}). Later work revises from here."
+                    + self._footer(state, ftext, smark) + note)
+
+        if RECOVER_RE.match(user_msg):
+            found = self._recover_revisions(messages or [])
+            if not found:
+                return ("No earlier plans found in this conversation — nothing to "
+                        "recover." + self._footer(state, ftext, smark))
+            stored = [r for r in revs if r.get("plan")]
+            if len(found) <= 1 and len(stored) >= len(found):
+                return (f"Found {len(found)} plan(s) in the chat, and {len(stored)} "
+                        "version(s) are already stored — nothing to add."
+                        + self._footer(state, ftext, smark))
+            note = await self._save(session, sid, state, pipe="venture-council",
+                                    revisions=found, plan=found[-1]["plan"],
+                                    fund=found[-1]["fund"], rounds=found[-1]["rounds"])
+            rows = "\n".join(
+                f"| **v{r['n']}** | {r['why'][:60]} | "
+                f"{'✅ CLEARED' if r['fund'] else '🛠️ REVISE'} | {len(r['plan']):,} |"
+                for r in found)
+            return (f"# ♻️ Recovered {len(found)} version(s) from this chat\n\n"
+                    "| # | why this version exists | red team | size |\n|---|---|---|---|\n"
+                    f"{rows}\n\n"
+                    "These were rebuilt from the plan messages in the conversation, so "
+                    "they carry no timestamp or TL;DR. **export 1** now writes the "
+                    "original, **diff 1 3** compares first to latest."
                     + self._footer(state, ftext, smark) + note)
 
         export = EXPORT_RE.match(user_msg)
@@ -1470,7 +1544,8 @@ class Pipe:
 
                     revs = self._revisions(cp)
                     versioned = await self._version_command(
-                        session, sid, user_msg, cp, revs, smark, STATE_PLAN_REVIEW)
+                        session, sid, user_msg, cp, revs, smark, STATE_PLAN_REVIEW,
+                        messages)
                     if versioned is not None:
                         return versioned
 
@@ -1538,7 +1613,8 @@ class Pipe:
                 if not new_v:
                     cp = await self._load(session, sid)
                     versioned = await self._version_command(
-                        session, sid, user_msg, cp, self._revisions(cp), smark, STATE_DONE)
+                        session, sid, user_msg, cp, self._revisions(cp), smark,
+                        STATE_DONE, messages)
                     if versioned is not None:
                         return versioned
                     # advisor mode: Q&A, docs, what-ifs — grounded in the plan
