@@ -510,6 +510,10 @@ class Pipe:
             default=10,
             description="Plan versions kept for `revisions` / `diff` / `keep`. Oldest beyond this are dropped; v1 is always kept.",
         )
+        MAX_MERGE_CHARS: int = Field(
+            default=75000,
+            description="Total characters of candidate plans passed to a merge, split evenly. Merges are the largest call the pipe makes; raise with REQUEST_TIMEOUT.",
+        )
         MAX_DOC_CHARS: int = Field(
             default=40000,
             description="Max characters of attached documents passed verbatim to every agent, across all files.",
@@ -1469,8 +1473,19 @@ class Pipe:
         # Revising: carry the plan being revised so the Decision Log accumulates
         # and answered board questions stay answered instead of reopening.
         if merge_plans:
-            synth_user += "\n\n# Candidate plans to reconcile\n" + "\n\n".join(
-                f"## Candidate v{lab}\n{txt}" for lab, txt in merge_plans)
+            # The candidates already embody the expert analysis, so re-sending
+            # every report doubles the prompt for no gain — and a merge is the
+            # largest call the pipe makes, the one that runs out of time first.
+            synth_user = self._synth_input(brief, roster, {}, docs)
+            budget = max(20000, v.MAX_MERGE_CHARS) // max(1, len(merge_plans))
+            parts = []
+            for lab, txt in merge_plans:
+                body = txt[:budget]
+                if len(body) < len(txt):
+                    body += (f"\n\n*[v{lab} truncated at {budget:,} chars to fit the "
+                             "merge budget — raise MAX_MERGE_CHARS for the full text]*")
+                parts.append(f"## Candidate v{lab}\n{body}")
+            synth_user += "\n\n# Candidate plans to reconcile\n" + "\n\n".join(parts)
             system = MERGE_SYSTEM
         elif prior_plan:
             synth_user += f"\n\n# Previous plan (revise this, do not restart)\n{prior_plan}"
@@ -1908,8 +1923,19 @@ class Pipe:
             )
         except Exception as e:
             await status("Failed", done=True)
+            # str(TimeoutError()) is "" — without the class name this block was
+            # blank, which is the least useful error message possible
+            kind = type(e).__name__
+            detail = str(e) or "(no message)"
+            hint = ""
+            if isinstance(e, asyncio.TimeoutError) or "Timeout" in kind:
+                hint = (f"\n\n⏱️ *The call exceeded REQUEST_TIMEOUT "
+                        f"({v.REQUEST_TIMEOUT}s). Large merges are the usual cause — "
+                        "raise REQUEST_TIMEOUT, or lower MAX_MERGE_CHARS to send "
+                        "less. Nothing was lost; resend to retry.*")
             return (
                 f"**Pipeline error** — check claude-wrapper (`{v.CLAUDE_BASE_URL}`) "
-                f"and the coordinator (`{v.COORDINATOR_URL}`).\n\n```\n{e}\n```"
+                f"and the coordinator (`{v.COORDINATOR_URL}`).\n\n"
+                f"```\n{kind}: {detail}\n```{hint}"
                 + self._footer(state, "Resend your last message to retry from where we left off.", smark)
             )
