@@ -63,6 +63,31 @@ def _is_approve(text: str) -> bool:
     t = re.sub(r"\b(?:please|thanks|thank you|pls|ty)\b", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t in APPROVE_PHRASES
+
+
+# Named housekeeping jobs OpenWebUI runs against the selected model. Matched by
+# name, never by truthiness: some builds pass __task__ on ordinary chat turns
+# too, and treating that as housekeeping swallows the founder's messages.
+OPENWEBUI_TASKS = frozenset({
+    "title_generation", "tags_generation", "emoji_generation",
+    "query_generation", "retrieval_query_generation",
+    "web_search_query_generation", "autocomplete_generation",
+    "follow_up_generation", "image_prompt_generation",
+    "moa_response_generation", "function_calling",
+})
+
+
+def _is_housekeeping(task, text: str) -> bool:
+    """True only for OpenWebUI's own background prompts, never a founder turn."""
+    name = getattr(task, "value", task)          # TASKS enum member or plain str
+    if isinstance(name, str):
+        # accepts "title_generation", "TASKS.TITLE_GENERATION", "TitleGeneration"
+        name = name.strip().lower().rsplit(".", 1)[-1]
+        if name in OPENWEBUI_TASKS:
+            return True
+    return bool(TASK_RE.match(text))
+
+
 BOARD_ANSWER_RE = re.compile(r"^\s*board\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
 SHOW_BOARD_RE = re.compile(r"^\s*board\s*$", re.IGNORECASE)
 SHOW_PLAN_RE = re.compile(r"^\s*plan\s*$", re.IGNORECASE)
@@ -830,7 +855,7 @@ class Pipe:
         # model after every turn. Answer it directly — no council, no status
         # events, no checkpoint — or it lands as a founder turn and forks a
         # junk session on every message.
-        if __task__ or TASK_RE.match(user_msg):
+        if _is_housekeeping(__task__, user_msg):
             async with aiohttp.ClientSession() as session:
                 return await self._chat(session, v.INTERVIEW_MODEL, TASK_SYSTEM, user_msg)
 
