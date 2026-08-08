@@ -415,6 +415,15 @@ class Pipe:
             description="Hard cap per model prompt; oversized prompts are middle-truncated (protects wrapper body limits and latency).",
         )
         REQUEST_TIMEOUT: int = Field(default=600, description="Per-request timeout in seconds.")
+        STOP_ON_DISCONNECT: bool = Field(
+            default=False,
+            description=(
+                "Poll the client connection between phases and halt if it looks disconnected. "
+                "Off by default: on some OpenWebUI/uvicorn builds is_disconnected() reports a "
+                "false positive once the request body is consumed, which stops every run at its "
+                "first phase. Pressing Stop cancels the pipe task either way."
+            ),
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -912,9 +921,10 @@ class Pipe:
         v = self.valves
 
         async def status(msg: str, done: bool = False):
-            # every phase reports here first, so this doubles as the stop check:
-            # pressing stop disconnects the client and halts before the next phase
-            if __request__ is not None and not done:
+            # Optional stop check: every phase reports here first, so polling the
+            # connection here halts before the next phase. Off by default — see
+            # STOP_ON_DISCONNECT; pressing stop cancels this task regardless.
+            if v.STOP_ON_DISCONNECT and __request__ is not None and not done:
                 try:
                     if await __request__.is_disconnected():
                         raise StopRun()
