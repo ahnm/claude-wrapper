@@ -91,9 +91,9 @@ def _is_housekeeping(task, text: str) -> bool:
 
 
 REVISIONS_RE = re.compile(r"^\s*(?:revisions|versions|history)\s*$", re.IGNORECASE)
-REVISION_SHOW_RE = re.compile(r"^\s*(?:revision|version|v)\s*#?\s*(\d+)\s*$", re.IGNORECASE)
-KEEP_RE = re.compile(r"^\s*(?:keep|restore|use)\s*#?\s*(\d+)\s*$", re.IGNORECASE)
-EXPORT_RE = re.compile(r"^\s*(?:export|save)(?:\s*#?\s*(\d+|all))?\s*$", re.IGNORECASE)
+REVISION_SHOW_RE = re.compile(r"^\s*(?:revision|version|v)\s*#?\s*([\d.]+)\s*$", re.IGNORECASE)
+KEEP_RE = re.compile(r"^\s*(?:keep|restore|use)\s*#?\s*([\d.]+)\s*$", re.IGNORECASE)
+EXPORT_RE = re.compile(r"^\s*(?:export|save)(?:\s*#?\s*([\d.]+|all))?\s*$", re.IGNORECASE)
 RECOVER_RE = re.compile(r"^\s*(?:recover|rebuild|import)(?:\s+(?:history|revisions))?\s*$",
                         re.IGNORECASE)
 # `revise:` reuses the cached expert reports; `rerun:` throws them away and
@@ -101,11 +101,13 @@ RECOVER_RE = re.compile(r"^\s*(?:recover|rebuild|import)(?:\s+(?:history|revisio
 # analysis instead of inheriting whatever the last run happened to produce.
 RERUN_RE = re.compile(
     r"^\s*(?:rerun|re-run|recouncil|reconvene|refresh)"
-    r"(?:\s+(?:from\s+)?#?\s*(\d+))?(?:\s*:\s*(.+))?\s*$",
+    r"(?:\s+(?:from\s+)?#?\s*([\d.]+))?(?:\s*:\s*(.+))?\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+# whitespace separates the two refs — a dotted label would otherwise swallow
+# a ".." separator whole
 DIFF_RE = re.compile(
-    r"^\s*(?:diff|compare)(?:\s*#?\s*(\d+))?(?:\s*(?:vs\.?|to|and|\.\.)?\s*#?\s*(\d+))?\s*$",
+    r"^\s*(?:diff|compare)(?:\s+#?\s*([\d.]+))?(?:\s+(?:vs\.?|to|and)?\s*#?\s*([\d.]+))?\s*$",
     re.IGNORECASE,
 )
 
@@ -117,7 +119,7 @@ RESUME_RE = re.compile(r"^\s*(?:resume|open|load)\s+(.+?)\s*$", re.IGNORECASE)
 NEW_VENTURE_RE = re.compile(r"^\s*new(?:\s+venture)?\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
 # `revise: x` revises the current plan; `revise 2: x` / `revise from 2: x`
 # branches from that version instead, without a separate `keep` first.
-REVISE_RE = re.compile(r"^\s*(?:revise|rework)(?:\s+(?:from\s+)?#?\s*(\d+))?\s*:\s*(.+)$",
+REVISE_RE = re.compile(r"^\s*(?:revise|rework)(?:\s+(?:from\s+)?#?\s*([\d.]+))?\s*:\s*(.+)$",
                        re.IGNORECASE | re.DOTALL)
 # OpenWebUI posts its own housekeeping prompts (chat title, tags, follow-ups,
 # search queries) to the selected model. They are not founder turns.
@@ -883,36 +885,82 @@ class Pipe:
                  "fund": cp.get("fund", False), "rounds": cp.get("rounds", 1)}]
 
     def _append_revision(self, revs: list, plan: str, why: str,
-                         fund: bool, rounds: int, tldr: str = "") -> list:
+                         fund: bool, rounds: int, tldr: str = "",
+                         parent=None) -> list:
         revs = list(revs)
+        if parent is None and revs:
+            parent = revs[-1]["n"]          # linear by default: child of the tip
         revs.append({"n": (revs[-1]["n"] + 1) if revs else 1, "why": why or "revision",
                      "plan": plan, "fund": fund, "rounds": rounds, "tldr": tldr,
-                     "at": time.time()})
+                     "at": time.time(), "parent": parent})
         cap = max(2, self.valves.MAX_REVISIONS)
         if len(revs) > cap:
             revs = revs[:1] + revs[-(cap - 1):]   # always keep v1 as the baseline
         return revs
 
     @staticmethod
-    def _find_revision(revs: list, n: int) -> Optional[dict]:
-        return next((r for r in revs if r.get("n") == n), None)
+    def _label_revisions(revs: list) -> dict:
+        """Dotted labels derived from the parent links, CVS-style: a straight
+        line stays flat (1, 2, 3) and a branch off revision R becomes R.b.n, so
+        the number itself says where a version came from.
+
+        1
+        └─ 2
+           ├─ 3          (continued the line)
+           └─ 2.1.1      (branched off 2)
+              └─ 2.1.2
+        """
+        label, kids, branches, trunk = {}, {}, {}, 0
+        for r in revs:
+            n, parent = r.get("n"), r.get("parent")
+            if parent is None or parent not in label:
+                trunk += 1
+                label[n] = str(trunk)
+            elif not kids.get(parent):
+                p = label[parent]
+                if "." in p:
+                    head, seq = p.rsplit(".", 1)
+                    label[n] = f"{head}.{int(seq) + 1}"
+                else:
+                    trunk = max(trunk, int(p)) + 1
+                    label[n] = str(trunk)
+            else:
+                branches[parent] = branches.get(parent, 0) + 1
+                label[n] = f"{label[parent]}.{branches[parent]}.1"
+            kids.setdefault(parent, []).append(n)
+        return label
+
+    @classmethod
+    def _find_revision(cls, revs: list, ref) -> Optional[dict]:
+        """Look a version up by its sequence number or its dotted label."""
+        ref = str(ref).strip()
+        if ref.isdigit():
+            hit = next((r for r in revs if r.get("n") == int(ref)), None)
+            if hit:
+                return hit
+        label = cls._label_revisions(revs)
+        return next((r for r in revs if label.get(r.get("n")) == ref), None)
 
     def _revision_table(self, revs: list, smark: str, state: str, ftext: str) -> str:
         if not revs:
             return ("No plan versions saved yet — they start accumulating once the "
                     "council has produced a plan."
                     + self._footer(state, ftext, smark))
+        label = self._label_revisions(revs)
+        depth = {r["n"]: label[r["n"]].count(".") for r in revs}
         rows = "\n".join(
-            f"| **v{r['n']}**{' ← current' if r is revs[-1] else ''} "
-            f"| {self._when(r.get('at'))} | {r.get('why','')[:70]} "
+            f"| {'&nbsp;' * 4 * depth[r['n']]}{'↳ ' if depth[r['n']] else ''}"
+            f"**v{label[r['n']]}**{' ← current' if r is revs[-1] else ''} "
+            f"| {('v' + label[r['parent']]) if r.get('parent') in label else '—'} "
+            f"| {self._when(r.get('at'))} | {r.get('why','')[:64]} "
             f"| {'✅ CLEARED' if r.get('fund') else '🛠️ REVISE'} "
             f"| {self._headline(r)} |"
             for r in revs
         )
         return (
             "# 🗂️ Plan versions\n\n"
-            "| # | created | why this version exists | red team | headline |\n"
-            "|---|---|---|---|---|\n"
+            "| version | from | created | why this version exists | red team | headline |\n"
+            "|---|---|---|---|---|---|\n"
             f"{rows}\n\n"
             f"**revision {revs[-1]['n']}** to re-show one · **diff** for the last two, "
             "or **diff 1 3** for a specific pair · **keep 2** to make that version "
@@ -961,7 +1009,8 @@ class Pipe:
             fund = "CLEARED" in head or bool(re.search(r"red team:\s*\*\*FUND", head))
             rounds = int(m2.group(1)) if (m2 := re.search(r"round (\d+)", head)) else 1
             out.append({"n": len(out) + 1, "why": pending, "plan": plan,
-                        "fund": fund, "rounds": rounds, "tldr": "", "at": None})
+                        "fund": fund, "rounds": rounds, "tldr": "", "at": None,
+                        "parent": len(out) or None})
             pending = "revision"
         return out
 
@@ -1034,12 +1083,13 @@ class Pipe:
         """Handle revisions / revision N / diff / keep N. None = not a version
         command, so the caller carries on with its normal gate handling."""
         ftext = self.GATE_TEXT if state == STATE_PLAN_REVIEW else self.DONE_TEXT
+        lbl = self._label_revisions(revs)
         if REVISIONS_RE.match(user_msg):
             return self._revision_table(revs, smark, state, ftext)
 
         show = REVISION_SHOW_RE.match(user_msg)
         if show:
-            r = self._find_revision(revs, int(show.group(1)))
+            r = self._find_revision(revs, show.group(1))
             if not r:
                 return (f"No version {show.group(1)}. Reply **revisions** to list them."
                         + self._footer(state, ftext, smark))
@@ -1048,18 +1098,19 @@ class Pipe:
 
         keep = KEEP_RE.match(user_msg)
         if keep:
-            r = self._find_revision(revs, int(keep.group(1)))
+            r = self._find_revision(revs, keep.group(1))
             if not r:
                 return (f"No version {keep.group(1)}. Reply **revisions** to list them."
                         + self._footer(state, ftext, smark))
             restored = self._append_revision(
-                revs, r["plan"], f"restored v{r['n']}", r.get("fund", False),
-                r.get("rounds", 1))
+                revs, r["plan"], f"restored v{lbl.get(r['n'], r['n'])}",
+                r.get("fund", False), r.get("rounds", 1), parent=r["n"])
             note = await self._save(session, sid, state, pipe="venture-council",
                                     plan=r["plan"], fund=r.get("fund", False),
                                     rounds=r.get("rounds", 1), revisions=restored)
-            return (f"✅ **v{r['n']} is now the current plan** (saved as "
-                    f"v{restored[-1]['n']}). Later work revises from here."
+            new_lbl = self._label_revisions(restored)[restored[-1]["n"]]
+            return (f"✅ **v{lbl.get(r['n'], r['n'])} is now the current plan** "
+                    f"(saved as v{new_lbl}). Later work builds from here."
                     + self._footer(state, ftext, smark) + note)
 
         if RECOVER_RE.match(user_msg):
@@ -1096,7 +1147,7 @@ class Pipe:
             if which == "all":
                 targets = revs
             elif which:
-                one = self._find_revision(revs, int(which))
+                one = self._find_revision(revs, which)
                 if not one:
                     return (f"No version {which}. Reply **revisions** to list them."
                             + self._footer(state, ftext, smark))
@@ -1122,9 +1173,9 @@ class Pipe:
                         + self._footer(state, ftext, smark))
             a_n, b_n = diff.group(1), diff.group(2)
             if a_n and b_n:
-                a, b = self._find_revision(revs, int(a_n)), self._find_revision(revs, int(b_n))
+                a, b = self._find_revision(revs, a_n), self._find_revision(revs, b_n)
             elif a_n:                      # "diff 2" = that version against current
-                a, b = self._find_revision(revs, int(a_n)), revs[-1]
+                a, b = self._find_revision(revs, a_n), revs[-1]
             else:                          # bare "diff" = the last two
                 a, b = revs[-2], revs[-1]
             if not a or not b:
@@ -1321,7 +1372,7 @@ class Pipe:
     async def _full_run(self, session, status, sid, smark, brief, sections=None,
                         roster=None, reports=None, findings: str = "",
                         docs: str = "", prior_plan: str = "", revisions=None,
-                        why: str = "", doc_files=None):
+                        why: str = "", doc_files=None, parent=None):
         """Roster -> experts -> synthesis -> stress loop -> plan message."""
         v = self.valves
         sections = sections if sections is not None else []
@@ -1353,7 +1404,8 @@ class Pipe:
         except Exception:
             tldr = ""  # a missing summary must never lose the plan
         revisions = self._append_revision(
-            revisions or [], plan, why or "initial plan", fund, rounds, tldr)
+            revisions or [], plan, why or "initial plan", fund, rounds, tldr,
+            parent=parent)
         vname = self._name_from(brief)
         note = await self._save(
             session, sid, STATE_PLAN_REVIEW, pipe="venture-council",
@@ -1567,20 +1619,23 @@ class Pipe:
                     board_answer = BOARD_ANSWER_RE.match(user_msg)
                     revise = REVISE_RE.match(user_msg)
                     rerun = RERUN_RE.match(user_msg)
+                    vlbl = self._label_revisions(revs)
+                    base_n = revs[-1]["n"] if revs else None
                     if rerun:
                         fb = (rerun.group(2) or "").strip()
                         findings = f"### Founder feedback\n{fb}" if fb else ""
                         why = f"rerun: {fb[:56]}" if fb else "rerun — fresh council"
                         if rerun.group(1):
-                            base = self._find_revision(revs, int(rerun.group(1)))
+                            base = self._find_revision(revs, rerun.group(1))
                             if not base:
                                 return (f"No version {rerun.group(1)} to rerun from. "
                                         "Reply **revisions** to list them."
                                         + self._footer(STATE_PLAN_REVIEW,
                                                        self.GATE_TEXT, smark))
-                            plan = base["plan"]
-                            why = (f"rerun (from v{base['n']}): {fb[:44]}" if fb
-                                   else f"rerun from v{base['n']} — fresh council")
+                            plan, base_n = base["plan"], base["n"]
+                            _bl = vlbl.get(base["n"], base["n"])
+                            why = (f"rerun (from v{_bl}): {fb[:44]}" if fb
+                                   else f"rerun from v{_bl} — fresh council")
                         # discard the cached roster and reports: the point of a
                         # rerun is analysis that is not inherited
                         roster, reports = None, None
@@ -1598,14 +1653,15 @@ class Pipe:
                         findings = f"### Founder feedback\n{feedback}"
                         why = f"revise: {feedback[:60]}"
                         if revise.group(1):     # branch from an older version
-                            base = self._find_revision(revs, int(revise.group(1)))
+                            base = self._find_revision(revs, revise.group(1))
                             if not base:
                                 return (f"No version {revise.group(1)} to revise from. "
                                         "Reply **revisions** to list them."
                                         + self._footer(STATE_PLAN_REVIEW,
                                                        self.GATE_TEXT, smark))
-                            plan = base["plan"]
-                            why = f"revise (from v{base['n']}): {feedback[:48]}"
+                            plan, base_n = base["plan"], base["n"]
+                            why = (f"revise (from v{vlbl.get(base['n'], base['n'])}): "
+                                   f"{feedback[:48]}")
                     elif not approved:
                         # questions / doc requests / what-ifs — never re-run the
                         # council by accident
@@ -1633,7 +1689,7 @@ class Pipe:
                         session, status, sid, smark, brief,
                         roster=roster, reports=reports, findings=findings, docs=docs,
                         prior_plan=plan, revisions=revs, why=why,
-                        doc_files=doc_files)
+                        doc_files=doc_files, parent=base_n)
 
                 # ---- DONE: advise / revise / new venture ----
                 new_v = NEW_VENTURE_RE.match(user_msg)
@@ -1650,15 +1706,18 @@ class Pipe:
                         why = (f"{'rerun' if rerun else 'revise'}: {feedback[:56]}"
                                if feedback else "rerun — fresh council")
                         revs_done = self._revisions(cp)
+                        dlbl = self._label_revisions(revs_done)
+                        base_n = revs_done[-1]["n"] if revs_done else None
                         if m.group(1):
-                            base = self._find_revision(revs_done, int(m.group(1)))
+                            base = self._find_revision(revs_done, m.group(1))
                             if not base:
                                 return (f"No version {m.group(1)} to work from. "
                                         "Reply **revisions** to list them."
                                         + self._footer(STATE_DONE, self.DONE_TEXT, smark))
-                            plan = base["plan"]
+                            plan, base_n = base["plan"], base["n"]
                             why = (f"{'rerun' if rerun else 'revise'} "
-                                   f"(from v{base['n']}): {feedback[:44]}")
+                                   f"(from v{dlbl.get(base['n'], base['n'])}): "
+                                   f"{feedback[:44]}")
                         await status("🔄 reconvening the full council…" if rerun else
                                      f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
                         return await self._full_run(
@@ -1668,7 +1727,7 @@ class Pipe:
                             findings=(f"### Founder feedback after delivery\n{feedback}"
                                       if feedback else ""),
                             docs=docs, prior_plan=plan, revisions=revs_done,
-                            why=why, doc_files=doc_files)
+                            why=why, doc_files=doc_files, parent=base_n)
                     # checkpoint incomplete → fall through to advisor
 
                 if not new_v:
