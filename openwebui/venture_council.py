@@ -96,6 +96,14 @@ KEEP_RE = re.compile(r"^\s*(?:keep|restore|use)\s*#?\s*(\d+)\s*$", re.IGNORECASE
 EXPORT_RE = re.compile(r"^\s*(?:export|save)(?:\s*#?\s*(\d+|all))?\s*$", re.IGNORECASE)
 RECOVER_RE = re.compile(r"^\s*(?:recover|rebuild|import)(?:\s+(?:history|revisions))?\s*$",
                         re.IGNORECASE)
+# `revise:` reuses the cached expert reports; `rerun:` throws them away and
+# convenes the council again, so an old plan can be re-derived from fresh
+# analysis instead of inheriting whatever the last run happened to produce.
+RERUN_RE = re.compile(
+    r"^\s*(?:rerun|re-run|recouncil|reconvene|refresh)"
+    r"(?:\s+(?:from\s+)?#?\s*(\d+))?(?:\s*:\s*(.+))?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 DIFF_RE = re.compile(
     r"^\s*(?:diff|compare)(?:\s*#?\s*(\d+))?(?:\s*(?:vs\.?|to|and|\.\.)?\s*#?\s*(\d+))?\s*$",
     re.IGNORECASE,
@@ -720,7 +728,8 @@ class Pipe:
 
     GATE_TEXT = (
         "🚦 **approve** → final package · **revise: <feedback>** → rework through the council "
-        "(**revise 2: <feedback>** branches from that version instead) · "
+        "(**revise 2: ...** branches from that version, **rerun: ...** convenes the "
+        "council again from scratch) · "
         "**board: <answer>** → collapse a Kill/Pursue branch, numbers recompute · "
         "**board** / **plan** → re-show · **revisions** / **diff** / **keep <n>** for version "
         "history · **export** (or **export 2** / **export all**) writes to disk · "
@@ -735,6 +744,7 @@ class Pipe:
         "💬 Ask anything or request docs (pitch deck, exec summary, investor email, what-ifs…) — "
         "I'll answer from the plan · **revise: <feedback>** reworks the plan through the council · "
         "**revisions** / **diff** / **keep <n>** / **export** for versions and files · "
+        "**rerun: <feedback>** re-convenes the council · "
         "**new venture: <idea>** starts the next cycle."
     )
 
@@ -1556,7 +1566,25 @@ class Pipe:
 
                     board_answer = BOARD_ANSWER_RE.match(user_msg)
                     revise = REVISE_RE.match(user_msg)
-                    if board_answer:
+                    rerun = RERUN_RE.match(user_msg)
+                    if rerun:
+                        fb = (rerun.group(2) or "").strip()
+                        findings = f"### Founder feedback\n{fb}" if fb else ""
+                        why = f"rerun: {fb[:56]}" if fb else "rerun — fresh council"
+                        if rerun.group(1):
+                            base = self._find_revision(revs, int(rerun.group(1)))
+                            if not base:
+                                return (f"No version {rerun.group(1)} to rerun from. "
+                                        "Reply **revisions** to list them."
+                                        + self._footer(STATE_PLAN_REVIEW,
+                                                       self.GATE_TEXT, smark))
+                            plan = base["plan"]
+                            why = (f"rerun (from v{base['n']}): {fb[:44]}" if fb
+                                   else f"rerun from v{base['n']} — fresh council")
+                        # discard the cached roster and reports: the point of a
+                        # rerun is analysis that is not inherited
+                        roster, reports = None, None
+                    elif board_answer:
                         answer = board_answer.group(1).strip()
                         findings = (
                             "The founder answered a Kill/Pursue Board question with real-world "
@@ -1599,7 +1627,8 @@ class Pipe:
                             smark) + note
 
                     # feedback or board answer -> targeted rework + fresh stress pass
-                    await status(f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
+                    await status("🔄 reconvening the full council…" if rerun else
+                                 f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
                     return await self._full_run(
                         session, status, sid, smark, brief,
                         roster=roster, reports=reports, findings=findings, docs=docs,
@@ -1609,28 +1638,35 @@ class Pipe:
                 # ---- DONE: advise / revise / new venture ----
                 new_v = NEW_VENTURE_RE.match(user_msg)
                 revise = None if new_v else REVISE_RE.match(user_msg)
+                rerun = None if new_v else RERUN_RE.match(user_msg)
 
-                if revise:
+                if revise or rerun:
                     cp = await self._load(session, sid)
                     brief = cp.get("brief", "")
                     plan = self._unwrap_completion(cp.get("plan", ""))
                     if brief and plan:
-                        feedback = revise.group(2).strip()
-                        why = f"revise: {feedback[:60]}"
+                        m = revise or rerun
+                        feedback = (m.group(2) or "").strip()
+                        why = (f"{'rerun' if rerun else 'revise'}: {feedback[:56]}"
+                               if feedback else "rerun — fresh council")
                         revs_done = self._revisions(cp)
-                        if revise.group(1):
-                            base = self._find_revision(revs_done, int(revise.group(1)))
+                        if m.group(1):
+                            base = self._find_revision(revs_done, int(m.group(1)))
                             if not base:
-                                return (f"No version {revise.group(1)} to revise from. "
+                                return (f"No version {m.group(1)} to work from. "
                                         "Reply **revisions** to list them."
                                         + self._footer(STATE_DONE, self.DONE_TEXT, smark))
                             plan = base["plan"]
-                            why = f"revise (from v{base['n']}): {feedback[:48]}"
-                        await status(f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
+                            why = (f"{'rerun' if rerun else 'revise'} "
+                                   f"(from v{base['n']}): {feedback[:44]}")
+                        await status("🔄 reconvening the full council…" if rerun else
+                                     f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
                         return await self._full_run(
                             session, status, sid, smark, brief,
-                            roster=cp.get("roster", []), reports=cp.get("reports", {}),
-                            findings=f"### Founder feedback after delivery\n{feedback}",
+                            roster=None if rerun else cp.get("roster", []),
+                            reports=None if rerun else cp.get("reports", {}),
+                            findings=(f"### Founder feedback after delivery\n{feedback}"
+                                      if feedback else ""),
                             docs=docs, prior_plan=plan, revisions=revs_done,
                             why=why, doc_files=doc_files)
                     # checkpoint incomplete → fall through to advisor
