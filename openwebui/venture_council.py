@@ -943,7 +943,15 @@ class Pipe:
         label, kids, branches, trunk = {}, {}, {}, 0
         for r in revs:
             n, parent = r.get("n"), r.get("parent")
-            if parent is None or parent not in label:
+            merged = [p for p in (r.get("parents") or []) if p in label]
+            if len(merged) > 1:
+                # A merge converges lines instead of forking one, so it takes the
+                # next trunk number. Deriving it from a parent would make the
+                # label depend on which version you named first.
+                trunk = max([trunk] + [int(label[p]) for p in merged
+                                       if "." not in label[p]]) + 1
+                label[n] = str(trunk)
+            elif parent is None or parent not in label:
                 trunk += 1
                 label[n] = str(trunk)
             elif not kids.get(parent):
