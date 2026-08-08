@@ -18,6 +18,7 @@ import asyncio
 import difflib
 import json
 import re
+import time
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
@@ -433,6 +434,14 @@ class Pipe:
             default=True, description="Expert reports and stress rounds as collapsible sections."
         )
         HISTORY_CHAR_BUDGET: int = Field(default=60000, description="Max history characters passed to models.")
+        OPENWEBUI_URL: str = Field(
+            default="http://localhost:8080",
+            description="OpenWebUI's own API, as seen from inside the container. Used to attach exported files so they're downloadable from any device.",
+        )
+        OPENWEBUI_API_KEY: str = Field(
+            default="",
+            description="OpenWebUI API key (Settings → Account → API keys). Without it, exports only go to the coordinator's disk folder.",
+        )
         AUTO_EXPORT: bool = Field(
             default=False,
             description="Write every synthesis to disk automatically. Off by default — reply `export` to save a version when you want it (needs the coordinator started with --artifacts DIR).",
@@ -734,10 +743,33 @@ class Pipe:
             return (f"\n\n⚠️ *Checkpoint not saved (coordinator unreachable: {e}) — "
                     "not resumable if this chat is lost.*")
 
+    async def _attach(self, session, filename: str, content: str) -> str:
+        """Upload one file to OpenWebUI so it is downloadable from any device —
+        the coordinator's folder lives on the host PC and a phone can't open it.
+        Returns a markdown link, or '' if uploads aren't configured."""
+        v = self.valves
+        if not v.OPENWEBUI_API_KEY:
+            return ""
+        form = aiohttp.FormData()
+        form.add_field("file", content.encode("utf-8"),
+                       filename=filename, content_type="text/markdown")
+        async with session.post(
+            f"{v.OPENWEBUI_URL.rstrip('/')}/api/v1/files/",
+            data=form,
+            headers={"Authorization": f"Bearer {v.OPENWEBUI_API_KEY}"},
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"upload {filename} -> {resp.status}")
+            fid = (await resp.json()).get("id")
+        return f"[{filename}](/api/v1/files/{fid}/content)" if fid else ""
+
     async def _export(self, session, name: str, version: int, brief: str, plan: str,
-                      tldr: str, reports: dict, docs_note: str = "") -> str:
-        """Write this version to disk via the coordinator (a host process — the
-        pipe itself is inside the container). Never fails the run."""
+                      tldr: str, reports: dict, why: str = "", fund=None, at=None) -> str:
+        """Write this version out two ways: to the coordinator's folder on the
+        host, and as OpenWebUI attachments — the host folder is unreachable from
+        a phone, so downloadable links are what make an export portable.
+        Never fails the run."""
         files = {"plan.md": plan, "brief.md": brief}
         if tldr:
             files["tldr.md"] = tldr
@@ -746,14 +778,44 @@ class Pipe:
             files["kill-pursue-board.md"] = plan[start:].split("\n## ")[0]
         for eid, rep in (reports or {}).items():
             files[f"expert-{eid}.md"] = self._unwrap_completion(rep)
+
+        # A file opened on its own — in a folder, or from the OpenWebUI file
+        # list — must say which venture and version it belongs to.
+        verdict = ("red team: CLEARED" if fund else
+                   "red team: REVISE" if fund is not None else "")
+        header = " · ".join(x for x in (
+            f"**{name}** — v{version}", self._when(at) if at else "", verdict) if x)
+        note = f"> {header}\n" + (f">\n> *Why this version: {why}*\n" if why else "")
+        files = {k: f"{note}\n{v}" for k, v in files.items()}
+
+        out = []
         try:
             res = await self._coord(session, "POST", "/artifacts", {
                 "name": name, "version": version, "files": files})
-            folder = res.get("folder", "")
-            return (f"\n📁 *Saved {len(res.get('written', []))} files to* `{folder}`\n"
-                    if folder else "")
+            if res.get("folder"):
+                out.append(f"📁 *{len(res.get('written', []))} files on the host:* "
+                           f"`{res['folder']}`")
         except Exception as e:
-            return f"\n⚠️ *Export failed ({e}) — the plan above is still checkpointed.*\n"
+            out.append(f"⚠️ *Disk export failed ({e}).*")
+
+        if self.valves.OPENWEBUI_API_KEY:
+            links, failed = [], 0
+            prefix = f"v{version}-"
+            for fname, content in sorted(files.items()):
+                try:
+                    link = await self._attach(session, prefix + fname, content)
+                    if link:
+                        links.append(link)
+                except Exception:
+                    failed += 1
+            if links:
+                out.append(f"📎 **v{version} downloads:** " + " · ".join(links)
+                           + (f" *({failed} failed)*" if failed else ""))
+            elif failed:
+                out.append(f"⚠️ *Could not attach files to OpenWebUI ({failed} failed).*")
+        if not out:
+            return "\n⚠️ *Nothing exported — the plan above is still checkpointed.*\n"
+        return "\n" + "\n\n".join(out) + "\n"
 
     async def _load(self, session, sid: str) -> dict:
         try:
@@ -769,13 +831,25 @@ class Pipe:
         vc = {k: s for k, s in sessions.items() if s.get("pipe") == "venture-council"}
         if not vc:
             return "No saved ventures yet. Describe your startup idea to begin."
+        def ago(sec):
+            sec = sec if isinstance(sec, (int, float)) else 0
+            for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+                if sec >= size:
+                    return f"{int(sec // size)}{unit} ago"
+            return "just now"
+
+        ordered = sorted(vc.items(), key=lambda kv: kv[1].get("updated_seconds_ago", 9e9))
+        # every row carries the exact command to send, so picking one is a copy
         rows = "\n".join(
-            f"| `{sid}` | {s.get('name','')} | `{s.get('phase','?')}` | {s.get('updated_seconds_ago','?')}s ago |"
-            for sid, s in vc.items()
+            f"| **{s.get('name') or '(unnamed)'}** | `{s.get('phase','?')}` | "
+            f"{ago(s.get('updated_seconds_ago'))} | **`resume {sid}`** |"
+            for sid, s in ordered
         )
-        return ("# 💾 Saved ventures\n\n| id | venture | phase | updated |\n|---|---|---|---|\n"
-                f"{rows}\n\nReply **resume &lt;id&gt;** — or part of the venture's name, "
-                "e.g. `resume eyewear` — to pick one up in this chat.")
+        return ("# 💾 Saved ventures\n\n"
+                "| venture | phase | updated | to continue it, send |\n|---|---|---|---|\n"
+                f"{rows}\n\n"
+                "Send the command in the last column — or just enough of the name, "
+                "like `resume eyewear`. It picks up in this chat, right where it left off.")
 
     # -- plan revisions -------------------------------------------------------
 
@@ -796,7 +870,8 @@ class Pipe:
                          fund: bool, rounds: int, tldr: str = "") -> list:
         revs = list(revs)
         revs.append({"n": (revs[-1]["n"] + 1) if revs else 1, "why": why or "revision",
-                     "plan": plan, "fund": fund, "rounds": rounds, "tldr": tldr})
+                     "plan": plan, "fund": fund, "rounds": rounds, "tldr": tldr,
+                     "at": time.time()})
         cap = max(2, self.valves.MAX_REVISIONS)
         if len(revs) > cap:
             revs = revs[:1] + revs[-(cap - 1):]   # always keep v1 as the baseline
@@ -812,18 +887,41 @@ class Pipe:
                     "council has produced a plan."
                     + self._footer(state, ftext, smark))
         rows = "\n".join(
-            f"| **{r['n']}**{' ← current' if r is revs[-1] else ''} | {r.get('why','')[:70]} "
-            f"| {'CLEARED' if r.get('fund') else 'REVISE'} | {len(r.get('plan','')):,} |"
+            f"| **v{r['n']}**{' ← current' if r is revs[-1] else ''} "
+            f"| {self._when(r.get('at'))} | {r.get('why','')[:70]} "
+            f"| {'✅ CLEARED' if r.get('fund') else '🛠️ REVISE'} "
+            f"| {self._headline(r)} |"
             for r in revs
         )
         return (
             "# 🗂️ Plan versions\n\n"
-            "| # | why this version exists | red team | size |\n|---|---|---|---|\n"
+            "| # | created | why this version exists | red team | headline |\n"
+            "|---|---|---|---|---|\n"
             f"{rows}\n\n"
             f"**revision {revs[-1]['n']}** to re-show one · **diff** for the last two, "
-            "or **diff 1 3** for a specific pair · **keep 2** to make that version current."
+            "or **diff 1 3** for a specific pair · **keep 2** to make that version "
+            "current · **export 2** to download it."
             + self._footer(state, ftext, smark)
         )
+
+    @staticmethod
+    def _when(ts) -> str:
+        if not isinstance(ts, (int, float)) or ts <= 0:
+            return "—"
+        return time.strftime("%b %d %H:%M", time.localtime(ts))
+
+    @staticmethod
+    def _headline(rev: dict) -> str:
+        """One line that distinguishes this version at a glance: the TL;DR's
+        verdict sentence, falling back to the plan's headline ARR figure."""
+        tldr = (rev.get("tldr") or "").replace("\n", " ")
+        m = re.search(r"\*\*Verdict\*\*[\s—:-]*(.+?)(?:\*\*|$)", tldr, re.IGNORECASE)
+        line = m.group(1) if m else ""
+        if not line:
+            m = re.search(r"(ARR[^|\n]{0,40})", rev.get("plan", ""), re.IGNORECASE)
+            line = m.group(1) if m else ""
+        line = re.sub(r"\s+", " ", line).strip(" .—-*")
+        return (line[:70] + "…") if len(line) > 70 else (line or "—")
 
     @staticmethod
     def _plan_sections(plan: str) -> dict:
@@ -923,7 +1021,8 @@ class Pipe:
             for r in targets:
                 lines.append(await self._export(
                     session, name, r["n"], brief, r.get("plan", ""),
-                    r.get("tldr", ""), reports))
+                    r.get("tldr", ""), reports, why=r.get("why", ""),
+                    fund=r.get("fund"), at=r.get("at")))
             return ("".join(lines) or "Nothing written.") + self._footer(state, ftext, smark)
 
         diff = DIFF_RE.match(user_msg)
@@ -1174,8 +1273,10 @@ class Pipe:
             revisions=revisions, tldr=tldr, doc_files=doc_files or [],
         )
         if v.AUTO_EXPORT:
-            artifacts = await self._export(session, vname, revisions[-1]["n"],
-                                           brief, plan, tldr, reports)
+            _r = revisions[-1]
+            artifacts = await self._export(
+                session, vname, _r["n"], brief, plan, tldr, reports,
+                why=_r.get("why", ""), fund=_r.get("fund"), at=_r.get("at"))
         else:
             artifacts = (f"\n📁 *Reply* **export** *to write v{revisions[-1]['n']} "
                          "to disk (plan, TL;DR, brief, board, expert reports).*\n")
