@@ -12,10 +12,13 @@ specialists chartered for your specific idea) → synthesis into a business plan
 with formula-driven financials (3 scenarios, cost/burn/runway tables), roadmap,
 Anchor Scorecard, and a **Kill/Pursue Board** (founder-only questions ranked by
 impact×uncertainty with IF-YES/IF-NO branch effects — transparent, never
-blocking) → skeptic + investor red team with unit-economics tripwires,
-findings triaged back to affected experts (spawning new specialists if needed)
-until `FUND` or the round cap → your plan gate → investor one-pager + 2-week
-validation sprint with pre-committed decision rules + decision log.
+blocking) → a three-persona red team: skeptic (unit-economics tripwires),
+investor (fundability), and operator — a bootstrapper who judges the plan as
+if no raise will ever arrive, on willingness to pay, the first ten customers,
+per-customer margin, and the month revenue covers burn — findings triaged back
+to affected experts (spawning new specialists if needed) until all three clear
+or the round cap → your plan gate → investor one-pager + 2-week validation
+sprint with pre-committed decision rules + decision log.
 
 At the plan gate: **approve**, plain feedback (goes through the rework loop),
 `board: <answer>` (collapses that question's branches and recomputes),

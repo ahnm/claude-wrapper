@@ -215,6 +215,49 @@ reasonableness, the biggest un-de-risked assumption, and whether the
 Kill/Pursue Board covers what diligence would ask. Numbered findings with
 severity. FINAL line exactly: `VERDICT: FUND` or `VERDICT: REVISE`."""
 
+OPERATOR_SYSTEM = """You are a bootstrapped operator — someone who has run a
+business that lived or died on customer revenue, never on a raise. Judge this
+plan as if NO outside funding will EVER arrive. A plan that only works after
+a round is a REVISE for you, however fundable an investor finds it.
+
+Interrogate:
+1. **Willingness to pay.** Would a real customer pay this price, today, from a
+   budget that already exists? Separate stated interest from money changing
+   hands. Whose budget line does this come out of, and what gets cut to
+   afford it?
+2. **First ten customers.** Not TAM — name the segments and the specific route
+   to ten paying logos. If the plan can't describe customer #1 concretely, say
+   so.
+3. **Per-customer economics at small scale.** Gross margin on ONE customer
+   including support hours, COGS, payment fees, refunds and free-tier drag —
+   not a blended future-state margin. Does the first customer make money?
+4. **Cash-flow positive without a raise.** Using the founder's own stated
+   budget as the only capital: what month does revenue cover burn, and is
+   that reachable before the money runs out? State the month or state that it
+   never arrives.
+5. **Repeat and retention.** Does revenue compound, or is this a churn
+   treadmill where growth stops the day acquisition spend stops?
+6. **Delivery capacity.** Who sells and who supports? Founder-hours per
+   customer, and the customer count at which that breaks. Every plan has a
+   number here; find it.
+7. **Cash mechanics.** Payment terms, collection lag, seasonality, refunds and
+   customer concentration — the things that kill profitable businesses.
+
+Where the plan's own numbers let you compute an answer, compute it and show
+the arithmetic. Flag any place the plan quietly assumes a raise, a runway
+extension, or a growth rate no customer has agreed to. Add any missing
+kill-condition phrased as a customer/revenue fact the founder can go verify.
+
+Numbered findings with severity [critical/major/minor], citing sections.
+FINAL line exactly: `VERDICT: VIABLE` or `VERDICT: REVISE`."""
+
+# (persona, system prompt, verdict token that means "no blocking objection")
+REDTEAM_PERSONAS = (
+    ("skeptic", SKEPTIC_SYSTEM, "FUND"),
+    ("investor", INVESTOR_SYSTEM, "FUND"),
+    ("operator", OPERATOR_SYSTEM, "VIABLE"),
+)
+
 TRIAGE_SYSTEM = """You are the lead strategist triaging red-team findings.
 Decide which experts must re-run with these findings, and whether a NEW
 specialist must be spawned for expertise the council lacks (at most
@@ -275,7 +318,10 @@ class Pipe:
         INTERVIEW_MODEL: str = Field(default="sonnet", description="Intake interviewer model.")
         EXPERT_MODEL: str = Field(default="sonnet", description="Core experts + spawned specialists model.")
         STRATEGIST_MODEL: str = Field(default="opus", description="Roster design, synthesis, triage, final package.")
-        REDTEAM_MODEL: str = Field(default="opus", description="Skeptic + investor stress-test personas.")
+        REDTEAM_MODEL: str = Field(
+            default="opus",
+            description="Stress-test personas: skeptic, investor (fundability), operator (customer revenue without a raise).",
+        )
         MAX_SPECIALISTS: int = Field(default=3, description="Cap on spawned specialists per venture.")
         MAX_STRESS_ROUNDS: int = Field(default=3, description="Stress-test/rework loop cap.")
         PARALLEL_EXPERTS: bool = Field(
@@ -418,9 +464,12 @@ class Pipe:
         return json.loads(blocks[-1] if blocks else text)
 
     @staticmethod
-    def _verdict_fund(text: str) -> bool:
+    def _verdict_clear(text: str, token: str) -> bool:
+        """True when the persona's final VERDICT is its own clearing token.
+        Each persona clears on its own word — the investor on FUND, the
+        operator on VIABLE — so no persona can be satisfied by another's."""
         matches = re.findall(r"VERDICT:\s*(\w+)", text, re.IGNORECASE)
-        return bool(matches) and matches[-1].upper() == "FUND"
+        return bool(matches) and matches[-1].upper() == token.upper()
 
     @staticmethod
     def _collapsible(title: str, content: str) -> str:
@@ -547,13 +596,14 @@ class Pipe:
         v = self.valves
         fund, round_no = False, 0
         for round_no in range(1, v.MAX_STRESS_ROUNDS + 1):
-            await status(f"🥊 Stress round {round_no}/{v.MAX_STRESS_ROUNDS}: skeptic + investor…")
+            roles = " + ".join(p for p, _, _ in REDTEAM_PERSONAS)
+            await status(f"🥊 Stress round {round_no}/{v.MAX_STRESS_ROUNDS}: {roles}…")
             target = f"# Venture Brief\n{brief}\n\n# Business Plan\n{plan}"
             critiques = []
-            for persona, prompt in (("skeptic", SKEPTIC_SYSTEM), ("investor", INVESTOR_SYSTEM)):
+            for persona, prompt, token in REDTEAM_PERSONAS:
                 try:
                     res = await self._chat(session, v.REDTEAM_MODEL, prompt, target)
-                    critiques.append((persona, res, self._verdict_fund(res)))
+                    critiques.append((persona, res, self._verdict_clear(res, token)))
                 except Exception as e:
                     critiques.append((persona, f"(red team unavailable: {e})", True))
             if v.SHOW_INTERMEDIATE:
@@ -618,7 +668,8 @@ class Pipe:
 
     def _plan_message(self, plan: str, fund: bool, rounds: int, roster: list,
                       reports: dict, sections: list, smark: str) -> str:
-        verdict = "FUND" if fund else f"REVISE after {rounds} round(s) — unresolved objections flagged below"
+        verdict = ("CLEARED — fundable and viable on customer revenue" if fund
+                   else f"REVISE after {rounds} round(s) — unresolved objections flagged below")
         out = f"{PLAN_HEADING} — round {rounds}, red team: **{verdict}**\n\n"
         out += self._roster_section(roster) + "\n\n" + plan + "\n"
         if self.valves.SHOW_INTERMEDIATE:
