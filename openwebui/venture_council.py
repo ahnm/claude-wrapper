@@ -102,7 +102,7 @@ BOARD_ANSWER_RE = re.compile(r"^\s*board\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL
 SHOW_BOARD_RE = re.compile(r"^\s*board\s*$", re.IGNORECASE)
 SHOW_PLAN_RE = re.compile(r"^\s*plan\s*$", re.IGNORECASE)
 SESSIONS_RE = re.compile(r"^\s*sessions\s*$", re.IGNORECASE)
-RESUME_RE = re.compile(r"^\s*resume\s+(\w+)\s*$", re.IGNORECASE)
+RESUME_RE = re.compile(r"^\s*(?:resume|open|load)\s+(.+?)\s*$", re.IGNORECASE)
 NEW_VENTURE_RE = re.compile(r"^\s*new(?:\s+venture)?\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
 REVISE_RE = re.compile(r"^\s*(?:revise|rework)\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
 # OpenWebUI posts its own housekeeping prompts (chat title, tags, follow-ups,
@@ -692,8 +692,17 @@ class Pipe:
 
     @staticmethod
     def _name_from(text: str) -> str:
-        first = next((ln for ln in text.strip().splitlines() if ln.strip()), "venture")
-        return re.sub(r"[#*`\-\s]+", " ", first).strip()[:60] or "venture"
+        """A venture label worth reading in the sessions list. The first line of
+        a brief is usually boilerplate ('FINAL — Venture Brief'), so prefer the
+        Idea line the brief format guarantees."""
+        idea = re.search(r"^[\s\-*]*\**\s*Idea\**\s*[:\-]\s*(.+)$",
+                         text or "", re.IGNORECASE | re.MULTILINE)
+        raw = idea.group(1) if idea else next(
+            (ln for ln in (text or "").strip().splitlines() if ln.strip()), "venture")
+        raw = re.sub(r"[#*`]+", " ", raw)
+        raw = re.sub(r"^\W*(?:final|draft)\b[\s—\-:]*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s+", " ", raw).strip(" -—:")
+        return raw[:60] or "venture"
 
     GATE_TEXT = (
         "🚦 **approve** → final package · **revise: <feedback>** → rework through the council · "
@@ -765,7 +774,8 @@ class Pipe:
             for sid, s in vc.items()
         )
         return ("# 💾 Saved ventures\n\n| id | venture | phase | updated |\n|---|---|---|---|\n"
-                f"{rows}\n\nReply **resume <id>** to continue one.")
+                f"{rows}\n\nReply **resume &lt;id&gt;** — or part of the venture's name, "
+                "e.g. `resume eyewear` — to pick one up in this chat.")
 
     # -- plan revisions -------------------------------------------------------
 
@@ -1199,11 +1209,36 @@ class Pipe:
         await status("Done", done=True)
         return answer + self._footer(state, footer_text, smark)
 
-    async def _resume(self, session, sid: str) -> str:
-        data = await self._load(session, sid)
+    async def _find_session(self, session, query: str):
+        """Resolve 'resume <x>' where x is an id, an id prefix, or part of the
+        venture's name — nobody remembers an 8-character hex id."""
+        query = (query or "").strip()
+        exact = await self._load(session, query)
+        if exact:
+            return query, exact, []
+        try:
+            all_s = await self._coord(session, "GET", "/sessions") or {}
+        except Exception:
+            return None, None, []
+        vc = {k: s for k, s in all_s.items() if s.get("pipe") == "venture-council"}
+        q = query.lower()
+        hits = [(sid, s) for sid, s in vc.items()
+                if sid.lower().startswith(q) or q in (s.get("name") or "").lower()]
+        if len(hits) == 1:
+            sid = hits[0][0]
+            return sid, await self._load(session, sid), []
+        return None, None, hits
+
+    async def _resume(self, session, query: str) -> str:
+        sid, data, ambiguous = await self._find_session(session, query)
+        if ambiguous:
+            rows = "\n".join(f"| `{s}` | {m.get('name','')} | `{m.get('phase','?')}` |"
+                             for s, m in ambiguous)
+            return (f"**{len(ambiguous)} ventures match “{query}”** — be more specific:\n\n"
+                    f"| id | venture | phase |\n|---|---|---|\n{rows}\n")
         if not data:
-            return (f"**Cannot resume `{sid}`** — not found or coordinator unreachable. "
-                    "Reply **sessions** to list saved ventures.")
+            return (f"**Cannot resume “{query}”** — no venture with that id or name "
+                    "(or the coordinator is unreachable). Reply **sessions** to list them.")
         phase = data.get("phase", STATE_INTAKE)
         smark = SESSION_MARKER.format(session=sid)
         header = f"# 🔁 Resumed `{sid}` — {data.get('name','')} *(phase: {phase})*\n\n"
