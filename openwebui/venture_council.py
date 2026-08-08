@@ -104,6 +104,10 @@ RERUN_RE = re.compile(
     r"(?:\s+(?:from\s+)?#?\s*([\d.]+))?(?:\s*:\s*(.+))?\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+MERGE_RE = re.compile(r"^\s*(?:merge|combine|synthesi[sz]e|best\s+of)\s+(.+?)\s*$",
+                      re.IGNORECASE)
+REF_RE = re.compile(r"^[\d.]+$")
+
 # whitespace separates the two refs — a dotted label would otherwise swallow
 # a ".." separator whole
 DIFF_RE = re.compile(
@@ -359,6 +363,30 @@ Output ONLY JSON:
   "notes": "one-line plan for the revision"}}
 Use only these existing ids: {expert_ids}. rerun/spawn may be empty if the
 findings are fixable by revising the plan alone."""
+
+MERGE_SYSTEM = SYNTHESIS_SYSTEM + """
+
+You are RECONCILING several candidate plans for the same venture, supplied
+below as versions. They are competing hypotheses, not drafts to average.
+
+- Do NOT split the difference. On each contested decision take the option the
+  evidence supports and name the version it came from.
+- Where versions disagree on a number, prefer the one whose input is labeled
+  [fact] over [estimate] over [guess]. If equally supported, carry the more
+  conservative figure and label the disagreement rather than hiding it.
+- Where one version has something the others simply lack, keep it.
+- Where versions are incompatible in a way the evidence cannot settle, do not
+  invent a winner: keep both as labeled branches and add the question to the
+  Kill/Pursue Board with the cheapest way to decide it.
+- A merged plan must be internally consistent: if you take pricing from one
+  version and CAC from another, recompute every figure that depends on them.
+  Never carry a total that its own inputs no longer produce.
+
+End with '## Reconciliation': a table
+| decision | taken from | why | what was discarded |
+covering every contested decision, then one sentence on what this merged plan
+can do that no single input version could. Carry the Decision Log forward from
+all inputs, de-duplicated, preserving each decision's original number."""
 
 RESYNTH_SYSTEM = SYNTHESIS_SYSTEM + """
 
@@ -734,7 +762,8 @@ class Pipe:
         "council again from scratch) · "
         "**board: <answer>** → collapse a Kill/Pursue branch, numbers recompute · "
         "**board** / **plan** → re-show · **revisions** / **diff** / **keep <n>** for version "
-        "history · **export** (or **export 2** / **export all**) writes to disk · "
+        "history · **merge 1 3** reconciles versions into a better one · "
+        "**export** (or **export 2** / **export all**) writes to disk · "
         "anything else (questions, docs, what-ifs) "
         "is answered from the plan without re-running the council."
     )
@@ -886,13 +915,14 @@ class Pipe:
 
     def _append_revision(self, revs: list, plan: str, why: str,
                          fund: bool, rounds: int, tldr: str = "",
-                         parent=None) -> list:
+                         parent=None, parents=None) -> list:
         revs = list(revs)
         if parent is None and revs:
             parent = revs[-1]["n"]          # linear by default: child of the tip
         revs.append({"n": (revs[-1]["n"] + 1) if revs else 1, "why": why or "revision",
                      "plan": plan, "fund": fund, "rounds": rounds, "tldr": tldr,
-                     "at": time.time(), "parent": parent})
+                     "at": time.time(), "parent": parent,
+                     "parents": parents or ([parent] if parent else [])})
         cap = max(2, self.valves.MAX_REVISIONS)
         if len(revs) > cap:
             revs = revs[:1] + revs[-(cap - 1):]   # always keep v1 as the baseline
@@ -951,7 +981,7 @@ class Pipe:
         rows = "\n".join(
             f"| {'&nbsp;' * 4 * depth[r['n']]}{'↳ ' if depth[r['n']] else ''}"
             f"**v{label[r['n']]}**{' ← current' if r is revs[-1] else ''} "
-            f"| {('v' + label[r['parent']]) if r.get('parent') in label else '—'} "
+            f"| {' + '.join('v' + label[p] for p in (r.get('parents') or [r.get('parent')]) if p in label) or '—'} "
             f"| {self._when(r.get('at'))} | {r.get('why','')[:64]} "
             f"| {'✅ CLEARED' if r.get('fund') else '🛠️ REVISE'} "
             f"| {self._headline(r)} |"
@@ -1372,7 +1402,8 @@ class Pipe:
     async def _full_run(self, session, status, sid, smark, brief, sections=None,
                         roster=None, reports=None, findings: str = "",
                         docs: str = "", prior_plan: str = "", revisions=None,
-                        why: str = "", doc_files=None, parent=None):
+                        why: str = "", doc_files=None, parent=None,
+                        merge_plans=None, parents=None):
         """Roster -> experts -> synthesis -> stress loop -> plan message."""
         v = self.valves
         sections = sections if sections is not None else []
@@ -1388,11 +1419,16 @@ class Pipe:
             synth_user += f"\n\n# Address these findings\n{findings}"
         # Revising: carry the plan being revised so the Decision Log accumulates
         # and answered board questions stay answered instead of reopening.
-        if prior_plan:
+        if merge_plans:
+            synth_user += "\n\n# Candidate plans to reconcile\n" + "\n\n".join(
+                f"## Candidate v{lab}\n{txt}" for lab, txt in merge_plans)
+            system = MERGE_SYSTEM
+        elif prior_plan:
             synth_user += f"\n\n# Previous plan (revise this, do not restart)\n{prior_plan}"
-        plan = await self._chat(
-            session, v.STRATEGIST_MODEL,
-            RESYNTH_SYSTEM if prior_plan else SYNTHESIS_SYSTEM, synth_user)
+            system = RESYNTH_SYSTEM
+        else:
+            system = SYNTHESIS_SYSTEM
+        plan = await self._chat(session, v.STRATEGIST_MODEL, system, synth_user)
         plan, fund, rounds, roster, reports = await self._stress_loop(
             session, status, brief, plan, roster, reports, sections, docs)
         await status(f"⚡ {v.STRATEGIST_MODEL} writing the TL;DR…")
@@ -1405,7 +1441,7 @@ class Pipe:
             tldr = ""  # a missing summary must never lose the plan
         revisions = self._append_revision(
             revisions or [], plan, why or "initial plan", fund, rounds, tldr,
-            parent=parent)
+            parent=parent, parents=parents)
         vname = self._name_from(brief)
         note = await self._save(
             session, sid, STATE_PLAN_REVIEW, pipe="venture-council",
@@ -1621,7 +1657,38 @@ class Pipe:
                     rerun = RERUN_RE.match(user_msg)
                     vlbl = self._label_revisions(revs)
                     base_n = revs[-1]["n"] if revs else None
-                    if rerun:
+                    merge_plans = merge_parents = None
+                    merge = MERGE_RE.match(user_msg)
+                    if merge:
+                        refs = [t for t in re.split(r"[,\s]+|\band\b", merge.group(1))
+                                if t and REF_RE.match(t)]
+                        picked, missing = [], []
+                        for t in refs:
+                            hit = self._find_revision(revs, t)
+                            (picked if hit else missing).append(hit or t)
+                        if missing:
+                            return (f"No version {', '.join(missing)}. Reply "
+                                    "**revisions** to list them."
+                                    + self._footer(STATE_PLAN_REVIEW, self.GATE_TEXT, smark))
+                        # dedupe while keeping the order the founder named them
+                        seen_n, uniq = set(), []
+                        for r in picked:
+                            if r["n"] not in seen_n:
+                                seen_n.add(r["n"])
+                                uniq.append(r)
+                        if len(uniq) < 2:
+                            return ("Name at least two versions to merge, e.g. "
+                                    "**merge 1 3** or **merge 2 2.1.1**."
+                                    + self._footer(STATE_PLAN_REVIEW, self.GATE_TEXT, smark))
+                        merge_plans = [(vlbl.get(r["n"], r["n"]), r.get("plan", ""))
+                                       for r in uniq]
+                        merge_parents = [r["n"] for r in uniq]
+                        base_n = uniq[0]["n"]
+                        labels = ", ".join(f"v{lab}" for lab, _ in merge_plans)
+                        why = f"merge of {labels}"
+                        findings = ""
+                        plan = ""      # the merge writes a plan, it does not revise one
+                    elif rerun:
                         fb = (rerun.group(2) or "").strip()
                         findings = f"### Founder feedback\n{fb}" if fb else ""
                         why = f"rerun: {fb[:56]}" if fb else "rerun — fresh council"
@@ -1683,13 +1750,17 @@ class Pipe:
                             smark) + note
 
                     # feedback or board answer -> targeted rework + fresh stress pass
-                    await status("🔄 reconvening the full council…" if rerun else
-                                 f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
+                    await status(
+                        f"🧬 {v.STRATEGIST_MODEL} reconciling {len(merge_plans)} plans…"
+                        if merge_plans else
+                        "🔄 reconvening the full council…" if rerun else
+                        f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
                     return await self._full_run(
                         session, status, sid, smark, brief,
                         roster=roster, reports=reports, findings=findings, docs=docs,
                         prior_plan=plan, revisions=revs, why=why,
-                        doc_files=doc_files, parent=base_n)
+                        doc_files=doc_files, parent=base_n,
+                        merge_plans=merge_plans, parents=merge_parents)
 
                 # ---- DONE: advise / revise / new venture ----
                 new_v = NEW_VENTURE_RE.match(user_msg)
