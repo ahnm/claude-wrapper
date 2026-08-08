@@ -107,6 +107,13 @@ RERUN_RE = re.compile(
 MERGE_RE = re.compile(r"^\s*(?:merge|combine|synthesi[sz]e|best\s+of)\s+(.+?)\s*$",
                       re.IGNORECASE)
 REF_RE = re.compile(r"^[\d.]+$")
+# "v2", "v2.1.1", "version 3" inside an ordinary question — requires the v/
+# version prefix so a bare figure in prose is never mistaken for a reference
+VREF_RE = re.compile(r"\bv(?:ersion)?\s*#?\s*(\d+(?:\.\d+)*)\b", re.IGNORECASE)
+FIRST_RE = re.compile(r"\b(?:original|first|earliest|initial)\s+(?:plan|version|one)\b",
+                      re.IGNORECASE)
+LATEST_RE = re.compile(r"\b(?:latest|current|newest|last)\s+(?:plan|version|one)\b",
+                       re.IGNORECASE)
 
 # whitespace separates the two refs — a dotted label would otherwise swallow
 # a ".." separator whole
@@ -410,6 +417,16 @@ final package below are ground truth. The founder may:
   produce them fully, consistent with the plan
 - explore what-if scenarios — recompute from the plan's stated formulas and
   inputs, labeling changed assumptions
+
+This venture may have several plan versions. Rules, without exception:
+- Answer from the CURRENT plan unless the founder names a version.
+- When they name one, answer from the section headed '# Plan v<label>' and
+  open by saying which version you used. Never take a figure from one version
+  and present it as another's — versions disagree, that is why they exist.
+- If they name a version whose text is not supplied, say so plainly and offer
+  `revision <n>` rather than answering from the current plan.
+- Comparing versions is fair game when their texts are both present; say which
+  number came from where.
 
 Stay consistent with the plan. If something truly requires re-running the
 expert council (structural changes, new evidence), say so and suggest
@@ -1052,6 +1069,30 @@ class Pipe:
             pending = "revision"
         return out
 
+    @classmethod
+    def _referenced_versions(cls, text: str, revs: list) -> list:
+        """Versions named in a question, as [(label, revision)] in the order
+        mentioned. Without this the advisor answers every question from the
+        current plan, silently attributing its figures to whatever the founder
+        asked about."""
+        if not revs:
+            return []
+        label = cls._label_revisions(revs)
+        picked, seen = [], set()
+
+        def take(rev):
+            if rev and rev["n"] not in seen:
+                seen.add(rev["n"])
+                picked.append((label.get(rev["n"], rev["n"]), rev))
+
+        for ref in VREF_RE.findall(text or ""):
+            take(cls._find_revision(revs, ref))
+        if FIRST_RE.search(text or ""):
+            take(revs[0])
+        if LATEST_RE.search(text or ""):
+            take(revs[-1])
+        return picked
+
     @staticmethod
     def _when(ts) -> str:
         if not isinstance(ts, (int, float)) or ts <= 0:
@@ -1478,11 +1519,34 @@ class Pipe:
         """Answer questions / generate docs / run what-ifs from the plan,
         without re-running the council."""
         v = self.valves
-        await status(f"💬 {v.STRATEGIST_MODEL} advising…")
+        revs = self._revisions(cp)
+        named = self._referenced_versions(user_msg, revs)
+        if named:
+            await status(f"💬 {v.STRATEGIST_MODEL} reading "
+                         + ", ".join(f"v{lab}" for lab, _ in named) + "…")
+        else:
+            await status(f"💬 {v.STRATEGIST_MODEL} advising…")
         context = (
             f"# Venture Brief\n{cp.get('brief', '(not saved)')}\n\n"
-            f"# Business Plan\n{self._unwrap_completion(cp.get('plan', '(not saved)'))}\n\n"
+            f"# Business Plan (current version)\n"
+            f"{self._unwrap_completion(cp.get('plan', '(not saved)'))}\n\n"
         )
+        if len(revs) > 1:
+            label = self._label_revisions(revs)
+            index = "\n".join(
+                f"- **v{label[r['n']]}**{' (current)' if r is revs[-1] else ''} — "
+                f"{r.get('why', '')[:70]}" for r in revs)
+            context += f"# Versions of this plan that exist\n{index}\n\n"
+        # only the versions actually asked about, so a question about v1 is not
+        # answered from the current plan
+        budget = self.valves.MAX_DOC_CHARS
+        for lab, r in named:
+            body = self._unwrap_completion(r.get("plan", ""))[:budget]
+            budget -= len(body)
+            context += (f"# Plan v{lab} (as asked about — *{r.get('why', '')}*)\n"
+                        f"{body}\n\n")
+            if budget <= 0:
+                break
         if cp.get("final"):
             context += f"# Final Package\n{self._unwrap_completion(cp['final'])}\n\n"
         if docs:
