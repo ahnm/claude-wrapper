@@ -27,6 +27,7 @@ terminal and merges only the successful branches.
 
 import argparse
 import json
+import os
 import re
 import threading
 import time
@@ -39,6 +40,46 @@ state_lock = threading.Lock()
 state = {"jobs": {}, "workers": {}, "sessions": {}}
 state_path = "council_state.json"
 auth_token = ""
+artifact_root = ""   # set by --artifacts; empty means /artifacts is disabled
+
+
+def _safe_segment(value: str, fallback: str) -> str:
+    """One path segment, letters/digits/dash only — never '..', never a drive."""
+    seg = re.sub(r"[^\w-]+", "-", str(value or "")).strip("-.")[:60]
+    return seg or fallback
+
+
+def write_artifacts(body: dict):
+    """Write {filename: content} under <root>/<venture>/v<n>/.
+
+    The pipe runs inside the OpenWebUI container, so it cannot put files
+    anywhere the founder can open them; the coordinator is a host process, so
+    exporting goes through here. Every path component is sanitized and the
+    result is re-checked against the root before anything is written.
+    """
+    if not artifact_root:
+        raise ValueError("artifact export is disabled (start with --artifacts DIR)")
+    files = body.get("files")
+    if not isinstance(files, dict) or not files:
+        raise ValueError("files must be a non-empty object of name -> content")
+
+    venture = _safe_segment(body.get("name"), "venture")
+    version = _safe_segment(f"v{body.get('version', 1)}", "v1")
+    folder = os.path.join(artifact_root, venture, version)
+    os.makedirs(folder, exist_ok=True)
+
+    written = []
+    for raw_name, content in files.items():
+        name = _safe_segment(os.path.splitext(os.path.basename(str(raw_name)))[0], "file")
+        ext = os.path.splitext(str(raw_name))[1].lower()
+        ext = ext if re.fullmatch(r"\.[a-z0-9]{1,5}", ext or "") else ".md"
+        path = os.path.join(folder, name + ext)
+        if os.path.commonpath([os.path.abspath(path), artifact_root]) != artifact_root:
+            raise ValueError(f"refusing to write outside the artifact root: {raw_name}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content if isinstance(content, str) else json.dumps(content, indent=2))
+        written.append(os.path.basename(path))
+    return sorted(written), folder
 
 
 def save_state():
@@ -306,6 +347,15 @@ class Handler(BaseHTTPRequestHandler):
                 save_state()
                 return self._json(200, {"ok": True})
 
+            if self.path == "/artifacts":
+                try:
+                    written, folder = write_artifacts(body)
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                except OSError as e:
+                    return self._json(500, {"error": f"write failed: {e}"})
+                return self._json(200, {"folder": folder, "written": written})
+
             if self.path == "/claim":
                 worker = body.get("worker", "anonymous")
                 tags = body.get("tags", [])
@@ -370,10 +420,15 @@ def main():
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--token", default="", help="shared secret for pipe + workers")
     ap.add_argument("--state", default="council_state.json")
+    ap.add_argument("--artifacts", default="",
+                    help="directory for plan exports; empty disables /artifacts")
     args = ap.parse_args()
     state_path, auth_token = args.state, args.token
+    global artifact_root
+    artifact_root = os.path.abspath(args.artifacts) if args.artifacts else ""
     load_state()
     print(f"Coordinator listening on 0.0.0.0:{args.port} (state: {state_path})")
+    print(f"Artifacts: {artifact_root or 'disabled (pass --artifacts DIR)'}")
     ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
 
 

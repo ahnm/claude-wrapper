@@ -20,6 +20,17 @@ to affected experts (spawning new specialists if needed) until all three clear
 or the round cap → your plan gate → investor one-pager + 2-week validation
 sprint with pre-committed decision rules + decision log.
 
+**Plan versions & export.** Every synthesis is kept as a numbered version:
+`revisions` lists them, `revision <n>` re-shows one, `diff` (or `diff 1 3`)
+compares section by section, `keep <n>` restores one. `revise:` carries the
+previous plan forward, so the Decision Log accumulates and answered board
+questions stay answered. Each version is also written to disk — start the
+coordinator with `--artifacts DIR` and every revision lands in
+`DIR/<venture>/v<n>/` as `plan.md`, `tldr.md`, `brief.md`,
+`kill-pursue-board.md` and one file per expert report. Turn it off with the
+`EXPORT_ARTIFACTS` valve. The message itself leads with collapsible detail
+and closes with a TL;DR.
+
 **Source documents.** Attach files to the message (the 📎 in OpenWebUI) and
 their full text is passed verbatim to the brief, every expert, the
 synthesizer and all three red-team personas, with instructions to treat what
