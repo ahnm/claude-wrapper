@@ -15,6 +15,7 @@ requirements: aiohttp
 """
 
 import asyncio
+import difflib
 import json
 import re
 import uuid
@@ -87,6 +88,14 @@ def _is_housekeeping(task, text: str) -> bool:
             return True
     return bool(TASK_RE.match(text))
 
+
+REVISIONS_RE = re.compile(r"^\s*(?:revisions|versions|history)\s*$", re.IGNORECASE)
+REVISION_SHOW_RE = re.compile(r"^\s*(?:revision|version|v)\s*#?\s*(\d+)\s*$", re.IGNORECASE)
+KEEP_RE = re.compile(r"^\s*(?:keep|restore|use)\s*#?\s*(\d+)\s*$", re.IGNORECASE)
+DIFF_RE = re.compile(
+    r"^\s*(?:diff|compare)(?:\s*#?\s*(\d+))?(?:\s*(?:vs\.?|to|and|\.\.)?\s*#?\s*(\d+))?\s*$",
+    re.IGNORECASE,
+)
 
 BOARD_ANSWER_RE = re.compile(r"^\s*board\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
 SHOW_BOARD_RE = re.compile(r"^\s*board\s*$", re.IGNORECASE)
@@ -361,6 +370,23 @@ Stay consistent with the plan. If something truly requires re-running the
 expert council (structural changes, new evidence), say so and suggest
 `revise: <the change>`. Respond in clean markdown."""
 
+TLDR_SYSTEM = """You are the lead strategist writing the TL;DR a founder reads
+first. Everything below it is already written — do not restate the plan, pull
+out what decides the next two weeks. Markdown, no headings above ###, under
+200 words total:
+
+**Verdict** — one sentence: is this worth building, and on what condition.
+**The numbers that matter** — 3-5 bullets, each a figure from the plan with
+its [fact]/[estimate]/[guess] label (ARR by year 1, CAC, LTV:CAC, payback
+months, month cash runs out). Never invent a number that is not in the plan.
+**Biggest risk** — one sentence, naming the assumption that would hurt most
+if wrong.
+**Do this next** — the top 3 Kill/Pursue questions as imperatives the founder
+can act on this week, cheapest first.
+
+If the red team did not clear the plan, say so in the verdict line and name
+the unresolved objection."""
+
 FINAL_SYSTEM = """You are the lead strategist producing the final founder
 package from the approved plan. Output markdown:
 
@@ -406,6 +432,10 @@ class Pipe:
             default=True, description="Expert reports and stress rounds as collapsible sections."
         )
         HISTORY_CHAR_BUDGET: int = Field(default=60000, description="Max history characters passed to models.")
+        MAX_REVISIONS: int = Field(
+            default=10,
+            description="Plan versions kept for `revisions` / `diff` / `keep`. Oldest beyond this are dropped; v1 is always kept.",
+        )
         MAX_DOC_CHARS: int = Field(
             default=40000,
             description="Max characters of attached documents passed verbatim to every agent, across all files.",
@@ -631,8 +661,9 @@ class Pipe:
     GATE_TEXT = (
         "🚦 **approve** → final package · **revise: <feedback>** → rework through the council · "
         "**board: <answer>** → collapse a Kill/Pursue branch, numbers recompute · "
-        "**board** / **plan** → re-show · anything else (questions, docs, what-ifs) is answered "
-        "from the plan without re-running the council."
+        "**board** / **plan** → re-show · **revisions** → version history, **diff** → what "
+        "changed, **keep <n>** → restore a version · anything else (questions, docs, what-ifs) "
+        "is answered from the plan without re-running the council."
     )
     INTAKE_TEXT = (
         "💬 Answer, correct any assumption, or add facts (guesses are fine — they're labeled). "
@@ -641,6 +672,7 @@ class Pipe:
     DONE_TEXT = (
         "💬 Ask anything or request docs (pitch deck, exec summary, investor email, what-ifs…) — "
         "I'll answer from the plan · **revise: <feedback>** reworks the plan through the council · "
+        "**revisions** / **diff** / **keep <n>** for version history · "
         "**new venture: <idea>** starts the next cycle."
     )
 
@@ -675,6 +707,151 @@ class Pipe:
         )
         return ("# 💾 Saved ventures\n\n| id | venture | phase | updated |\n|---|---|---|---|\n"
                 f"{rows}\n\nReply **resume <id>** to continue one.")
+
+    # -- plan revisions -------------------------------------------------------
+
+    @staticmethod
+    def _revisions(cp: dict) -> list:
+        """Stored plan versions, oldest first. Older checkpoints have none, so
+        synthesize v1 from the current plan rather than showing an empty list."""
+        revs = cp.get("revisions")
+        if isinstance(revs, list) and revs:
+            return revs
+        plan = Pipe._unwrap_completion(cp.get("plan", ""))
+        if not plan:
+            return []
+        return [{"n": 1, "why": "initial plan", "plan": plan,
+                 "fund": cp.get("fund", False), "rounds": cp.get("rounds", 1)}]
+
+    def _append_revision(self, revs: list, plan: str, why: str,
+                         fund: bool, rounds: int, tldr: str = "") -> list:
+        revs = list(revs)
+        revs.append({"n": (revs[-1]["n"] + 1) if revs else 1, "why": why or "revision",
+                     "plan": plan, "fund": fund, "rounds": rounds, "tldr": tldr})
+        cap = max(2, self.valves.MAX_REVISIONS)
+        if len(revs) > cap:
+            revs = revs[:1] + revs[-(cap - 1):]   # always keep v1 as the baseline
+        return revs
+
+    @staticmethod
+    def _find_revision(revs: list, n: int) -> Optional[dict]:
+        return next((r for r in revs if r.get("n") == n), None)
+
+    def _revision_table(self, revs: list, smark: str, state: str, ftext: str) -> str:
+        if not revs:
+            return ("No plan versions saved yet — they start accumulating once the "
+                    "council has produced a plan."
+                    + self._footer(state, ftext, smark))
+        rows = "\n".join(
+            f"| **{r['n']}**{' ← current' if r is revs[-1] else ''} | {r.get('why','')[:70]} "
+            f"| {'CLEARED' if r.get('fund') else 'REVISE'} | {len(r.get('plan','')):,} |"
+            for r in revs
+        )
+        return (
+            "# 🗂️ Plan versions\n\n"
+            "| # | why this version exists | red team | size |\n|---|---|---|---|\n"
+            f"{rows}\n\n"
+            f"**revision {revs[-1]['n']}** to re-show one · **diff** for the last two, "
+            "or **diff 1 3** for a specific pair · **keep 2** to make that version current."
+            + self._footer(state, ftext, smark)
+        )
+
+    @staticmethod
+    def _plan_sections(plan: str) -> dict:
+        """Split a plan into '## heading' -> body, so a diff can be reported per
+        section instead of as one wall of line noise."""
+        out, heading, buf = {}, "(preamble)", []
+        for line in (plan or "").splitlines():
+            if line.startswith("## "):
+                out[heading] = "\n".join(buf).strip()
+                heading, buf = line[3:].strip(), []
+            else:
+                buf.append(line)
+        out[heading] = "\n".join(buf).strip()
+        return {k: v for k, v in out.items() if v}
+
+    def _diff_plans(self, a: dict, b: dict, smark: str, state: str, ftext: str) -> str:
+        sa, sb = self._plan_sections(a.get("plan", "")), self._plan_sections(b.get("plan", ""))
+        added = [k for k in sb if k not in sa]
+        removed = [k for k in sa if k not in sb]
+        changed = [k for k in sb if k in sa and sa[k] != sb[k]]
+        same = [k for k in sb if k in sa and sa[k] == sb[k]]
+
+        out = [f"# 🔍 v{a['n']} → v{b['n']}",
+               f"*v{a['n']}: {a.get('why','')}* → *v{b['n']}: {b.get('why','')}*", ""]
+        out.append(f"**{len(changed)} section(s) changed**, {len(added)} added, "
+                   f"{len(removed)} removed, {len(same)} identical.\n")
+        if added:
+            out.append("**Added:** " + ", ".join(f"`{k}`" for k in added))
+        if removed:
+            out.append("**Removed:** " + ", ".join(f"`{k}`" for k in removed))
+        if same:
+            out.append("**Unchanged:** " + ", ".join(f"`{k}`" for k in same))
+        out.append("")
+        for k in changed:
+            body = "\n".join(difflib.unified_diff(
+                sa[k].splitlines(), sb[k].splitlines(),
+                fromfile=f"v{a['n']}", tofile=f"v{b['n']}", lineterm="", n=1))
+            if len(body) > 6000:
+                body = body[:6000] + "\n… (diff truncated)"
+            out.append(self._collapsible(f"✏️ {k}", f"```diff\n{body}\n```"))
+        if not changed and not added and not removed:
+            out.append("*The two versions are textually identical.*")
+        return "\n".join(out) + self._footer(state, ftext, smark)
+
+    async def _version_command(self, session, sid, user_msg, cp, revs, smark, state):
+        """Handle revisions / revision N / diff / keep N. None = not a version
+        command, so the caller carries on with its normal gate handling."""
+        ftext = self.GATE_TEXT if state == STATE_PLAN_REVIEW else self.DONE_TEXT
+        if REVISIONS_RE.match(user_msg):
+            return self._revision_table(revs, smark, state, ftext)
+
+        show = REVISION_SHOW_RE.match(user_msg)
+        if show:
+            r = self._find_revision(revs, int(show.group(1)))
+            if not r:
+                return (f"No version {show.group(1)}. Reply **revisions** to list them."
+                        + self._footer(state, ftext, smark))
+            return (f"# 📊 Plan v{r['n']} — *{r.get('why','')}*\n\n{r['plan']}"
+                    + self._footer(state, ftext, smark))
+
+        keep = KEEP_RE.match(user_msg)
+        if keep:
+            r = self._find_revision(revs, int(keep.group(1)))
+            if not r:
+                return (f"No version {keep.group(1)}. Reply **revisions** to list them."
+                        + self._footer(state, ftext, smark))
+            restored = self._append_revision(
+                revs, r["plan"], f"restored v{r['n']}", r.get("fund", False),
+                r.get("rounds", 1))
+            note = await self._save(session, sid, state, pipe="venture-council",
+                                    plan=r["plan"], fund=r.get("fund", False),
+                                    rounds=r.get("rounds", 1), revisions=restored)
+            return (f"✅ **v{r['n']} is now the current plan** (saved as "
+                    f"v{restored[-1]['n']}). Later work revises from here."
+                    + self._footer(state, ftext, smark) + note)
+
+        diff = DIFF_RE.match(user_msg)
+        if diff:
+            if len(revs) < 2:
+                return ("Only one plan version so far — nothing to compare. Versions "
+                        "accumulate as you `revise:` or answer `board:` questions."
+                        + self._footer(state, ftext, smark))
+            a_n, b_n = diff.group(1), diff.group(2)
+            if a_n and b_n:
+                a, b = self._find_revision(revs, int(a_n)), self._find_revision(revs, int(b_n))
+            elif a_n:                      # "diff 2" = that version against current
+                a, b = self._find_revision(revs, int(a_n)), revs[-1]
+            else:                          # bare "diff" = the last two
+                a, b = revs[-2], revs[-1]
+            if not a or not b:
+                return ("Those versions don't both exist — reply **revisions** to list them."
+                        + self._footer(state, ftext, smark))
+            if a["n"] == b["n"]:
+                return ("That's the same version on both sides."
+                        + self._footer(state, ftext, smark))
+            return self._diff_plans(a, b, smark, state, ftext)
+        return None
 
     # -- council phases -------------------------------------------------------
 
@@ -819,11 +996,25 @@ class Pipe:
         return "## Council Roster\n" + "\n".join(lines)
 
     def _plan_message(self, plan: str, fund: bool, rounds: int, roster: list,
-                      reports: dict, sections: list, smark: str) -> str:
+                      reports: dict, sections: list, smark: str,
+                      tldr: str = "", version: int = 0, artifacts: str = "") -> str:
+        """Detail folded into expandable sections, TL;DR last — it is the part
+        that gets read, so it sits closest to where you type."""
         verdict = ("CLEARED — fundable and viable on customer revenue" if fund
-                   else f"REVISE after {rounds} round(s) — unresolved objections flagged below")
-        out = f"{PLAN_HEADING} — round {rounds}, red team: **{verdict}**\n\n"
-        out += self._roster_section(roster) + "\n\n" + plan + "\n"
+                   else f"REVISE after {rounds} round(s) — unresolved objections below")
+        vtag = f" v{version}" if version else ""
+        out = f"{PLAN_HEADING}{vtag} — round {rounds}, red team: **{verdict}**\n\n"
+
+        board = ""
+        start = plan.rfind(BOARD_HEADING)
+        if start != -1:
+            board = plan[start:].split("\n## ")[0]
+
+        words = len(plan.split())
+        out += self._collapsible(f"📄 <b>Full business plan</b> — {words:,} words", plan)
+        if board:
+            out += self._collapsible("🎯 <b>Kill/Pursue Board</b> — what to go verify", board)
+        out += self._collapsible("🧩 Council roster", self._roster_section(roster))
         if self.valves.SHOW_INTERMEDIATE:
             # unwrap self-heals reports checkpointed while the wrapper was
             # double-encoding responses
@@ -833,13 +1024,21 @@ class Pipe:
             ]
             sections = [self._unwrap_completion(s) if s.lstrip().startswith("{") else s
                         for s in sections]
-            out += f"\n---\n{RECORDS_HEADING}\n\n" + "\n".join(expert_secs + sections)
+            out += self._collapsible(
+                f"📋 Council records — {len(expert_secs)} expert report(s), "
+                f"{len(sections)} stress round entr(ies)",
+                "\n".join(expert_secs + sections))
+        if artifacts:
+            out += f"\n{artifacts}\n"
+        if tldr:
+            out += f"\n---\n\n## ⚡ TL;DR\n\n{tldr}\n"
         out += self._footer(STATE_PLAN_REVIEW, self.GATE_TEXT, smark)
         return out
 
     async def _full_run(self, session, status, sid, smark, brief, sections=None,
                         roster=None, reports=None, findings: str = "",
-                        docs: str = ""):
+                        docs: str = "", prior_plan: str = "", revisions=None,
+                        why: str = ""):
         """Roster -> experts -> synthesis -> stress loop -> plan message."""
         v = self.valves
         sections = sections if sections is not None else []
@@ -853,16 +1052,34 @@ class Pipe:
         synth_user = self._synth_input(brief, roster, reports, docs)
         if findings:
             synth_user += f"\n\n# Address these findings\n{findings}"
-        plan = await self._chat(session, v.STRATEGIST_MODEL, SYNTHESIS_SYSTEM, synth_user)
+        # Revising: carry the plan being revised so the Decision Log accumulates
+        # and answered board questions stay answered instead of reopening.
+        if prior_plan:
+            synth_user += f"\n\n# Previous plan (revise this, do not restart)\n{prior_plan}"
+        plan = await self._chat(
+            session, v.STRATEGIST_MODEL,
+            RESYNTH_SYSTEM if prior_plan else SYNTHESIS_SYSTEM, synth_user)
         plan, fund, rounds, roster, reports = await self._stress_loop(
             session, status, brief, plan, roster, reports, sections, docs)
+        await status(f"⚡ {v.STRATEGIST_MODEL} writing the TL;DR…")
+        try:
+            tldr = await self._chat(
+                session, v.STRATEGIST_MODEL, TLDR_SYSTEM,
+                f"# Venture Brief\n{brief}\n\n# Business Plan\n{plan}\n\n"
+                f"# Red team cleared the plan\n{fund}")
+        except Exception:
+            tldr = ""  # a missing summary must never lose the plan
+        revisions = self._append_revision(
+            revisions or [], plan, why or "initial plan", fund, rounds, tldr)
         note = await self._save(
             session, sid, STATE_PLAN_REVIEW, pipe="venture-council",
             name=self._name_from(brief), brief=brief, plan=plan,
             roster=roster, reports=reports, fund=fund, rounds=rounds,
+            revisions=revisions, tldr=tldr,
         )
         await status("Plan ready — your gate", done=True)
-        return self._plan_message(plan, fund, rounds, roster, reports, sections, smark) + note
+        return self._plan_message(plan, fund, rounds, roster, reports, sections, smark,
+                                  tldr=tldr, version=revisions[-1]["n"]) + note
 
     # -- resume ---------------------------------------------------------------
 
@@ -898,9 +1115,11 @@ class Pipe:
         smark = SESSION_MARKER.format(session=sid)
         header = f"# 🔁 Resumed `{sid}` — {data.get('name','')} *(phase: {phase})*\n\n"
         if phase == STATE_PLAN_REVIEW and data.get("plan"):
+            revs = self._revisions(data)
             return header + self._plan_message(
                 data["plan"], data.get("fund", False), data.get("rounds", 1),
-                data.get("roster", []), data.get("reports", {}), [], smark)
+                data.get("roster", []), data.get("reports", {}), [], smark,
+                tldr=data.get("tldr", ""), version=revs[-1]["n"] if revs else 0)
         if phase == STATE_DONE:
             final = self._unwrap_completion(data.get("final") or "This venture's package was delivered.")
             return header + final + self._footer(STATE_DONE, self.DONE_TEXT, smark)
@@ -1008,25 +1227,37 @@ class Pipe:
                                 + self._footer(STATE_INTAKE, self.INTAKE_TEXT, smark))
 
                     if SHOW_PLAN_RE.match(user_msg):
-                        return self._plan_message(plan, cp.get("fund", False),
-                                                  cp.get("rounds", 1), roster, reports, [], smark)
+                        _revs = self._revisions(cp)
+                        return self._plan_message(
+                            plan, cp.get("fund", False), cp.get("rounds", 1),
+                            roster, reports, [], smark, tldr=cp.get("tldr", ""),
+                            version=_revs[-1]["n"] if _revs else 0)
                     if SHOW_BOARD_RE.match(user_msg):
                         start = plan.rfind(BOARD_HEADING)
                         board = plan[start:] if start != -1 else "(no board found in the plan)"
                         board = board.split("\n## ")[0]
                         return board + self._footer(STATE_PLAN_REVIEW, self.GATE_TEXT, smark)
 
+                    revs = self._revisions(cp)
+                    versioned = await self._version_command(
+                        session, sid, user_msg, cp, revs, smark, STATE_PLAN_REVIEW)
+                    if versioned is not None:
+                        return versioned
+
                     board_answer = BOARD_ANSWER_RE.match(user_msg)
                     revise = REVISE_RE.match(user_msg)
                     if board_answer:
+                        answer = board_answer.group(1).strip()
                         findings = (
                             "The founder answered a Kill/Pursue Board question with real-world "
-                            f"information: \"{board_answer.group(1).strip()}\". Collapse the "
+                            f"information: \"{answer}\". Collapse the "
                             "affected branches, recompute financials/roadmap from the model "
                             "inputs, resolve the question on the board, and append to the "
                             "Decision Log.")
+                        why = f"board: {answer[:60]}"
                     elif revise:
                         findings = f"### Founder feedback\n{revise.group(1).strip()}"
+                        why = f"revise: {revise.group(1).strip()[:60]}"
                     elif not approved:
                         # questions / doc requests / what-ifs — never re-run the
                         # council by accident
@@ -1051,7 +1282,8 @@ class Pipe:
                     await status(f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
                     return await self._full_run(
                         session, status, sid, smark, brief,
-                        roster=roster, reports=reports, findings=findings, docs=docs)
+                        roster=roster, reports=reports, findings=findings, docs=docs,
+                        prior_plan=plan, revisions=revs, why=why)
 
                 # ---- DONE: advise / revise / new venture ----
                 new_v = NEW_VENTURE_RE.match(user_msg)
@@ -1067,12 +1299,17 @@ class Pipe:
                             session, status, sid, smark, brief,
                             roster=cp.get("roster", []), reports=cp.get("reports", {}),
                             findings=f"### Founder feedback after delivery\n{revise.group(1).strip()}",
-                            docs=docs)
+                            docs=docs, prior_plan=plan, revisions=self._revisions(cp),
+                            why=f"revise: {revise.group(1).strip()[:60]}")
                     # checkpoint incomplete → fall through to advisor
 
                 if not new_v:
-                    # advisor mode: Q&A, docs, what-ifs — grounded in the plan
                     cp = await self._load(session, sid)
+                    versioned = await self._version_command(
+                        session, sid, user_msg, cp, self._revisions(cp), smark, STATE_DONE)
+                    if versioned is not None:
+                        return versioned
+                    # advisor mode: Q&A, docs, what-ifs — grounded in the plan
                     return await self._advise(session, status, cp, user_msg,
                                               messages, STATE_DONE, self.DONE_TEXT,
                                               smark, docs)
