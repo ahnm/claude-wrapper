@@ -107,7 +107,10 @@ SHOW_PLAN_RE = re.compile(r"^\s*plan\s*$", re.IGNORECASE)
 SESSIONS_RE = re.compile(r"^\s*sessions\s*$", re.IGNORECASE)
 RESUME_RE = re.compile(r"^\s*(?:resume|open|load)\s+(.+?)\s*$", re.IGNORECASE)
 NEW_VENTURE_RE = re.compile(r"^\s*new(?:\s+venture)?\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
-REVISE_RE = re.compile(r"^\s*(?:revise|rework)\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
+# `revise: x` revises the current plan; `revise 2: x` / `revise from 2: x`
+# branches from that version instead, without a separate `keep` first.
+REVISE_RE = re.compile(r"^\s*(?:revise|rework)(?:\s+(?:from\s+)?#?\s*(\d+))?\s*:\s*(.+)$",
+                       re.IGNORECASE | re.DOTALL)
 # OpenWebUI posts its own housekeeping prompts (chat title, tags, follow-ups,
 # search queries) to the selected model. They are not founder turns.
 # Modern OpenWebUI passes __task__; the heading is the fallback for older
@@ -716,7 +719,8 @@ class Pipe:
         return raw[:60] or "venture"
 
     GATE_TEXT = (
-        "🚦 **approve** → final package · **revise: <feedback>** → rework through the council · "
+        "🚦 **approve** → final package · **revise: <feedback>** → rework through the council "
+        "(**revise 2: <feedback>** branches from that version instead) · "
         "**board: <answer>** → collapse a Kill/Pursue branch, numbers recompute · "
         "**board** / **plan** → re-show · **revisions** / **diff** / **keep <n>** for version "
         "history · **export** (or **export 2** / **export all**) writes to disk · "
@@ -902,7 +906,8 @@ class Pipe:
             f"{rows}\n\n"
             f"**revision {revs[-1]['n']}** to re-show one · **diff** for the last two, "
             "or **diff 1 3** for a specific pair · **keep 2** to make that version "
-            "current · **export 2** to download it."
+            "current, or **revise 2: <feedback>** to branch straight from it · "
+            "**export 2** to download it."
             + self._footer(state, ftext, smark)
         )
 
@@ -933,7 +938,7 @@ class Pipe:
             if m.get("role") == "user":
                 rev, board = REVISE_RE.match(content), BOARD_ANSWER_RE.match(content)
                 if rev:
-                    pending = f"revise: {rev.group(1).strip()[:60]}"
+                    pending = f"revise: {rev.group(2).strip()[:60]}"
                 elif board:
                     pending = f"board: {board.group(1).strip()[:60]}"
                 continue
@@ -1561,8 +1566,18 @@ class Pipe:
                             "Decision Log.")
                         why = f"board: {answer[:60]}"
                     elif revise:
-                        findings = f"### Founder feedback\n{revise.group(1).strip()}"
-                        why = f"revise: {revise.group(1).strip()[:60]}"
+                        feedback = revise.group(2).strip()
+                        findings = f"### Founder feedback\n{feedback}"
+                        why = f"revise: {feedback[:60]}"
+                        if revise.group(1):     # branch from an older version
+                            base = self._find_revision(revs, int(revise.group(1)))
+                            if not base:
+                                return (f"No version {revise.group(1)} to revise from. "
+                                        "Reply **revisions** to list them."
+                                        + self._footer(STATE_PLAN_REVIEW,
+                                                       self.GATE_TEXT, smark))
+                            plan = base["plan"]
+                            why = f"revise (from v{base['n']}): {feedback[:48]}"
                     elif not approved:
                         # questions / doc requests / what-ifs — never re-run the
                         # council by accident
@@ -1600,14 +1615,24 @@ class Pipe:
                     brief = cp.get("brief", "")
                     plan = self._unwrap_completion(cp.get("plan", ""))
                     if brief and plan:
+                        feedback = revise.group(2).strip()
+                        why = f"revise: {feedback[:60]}"
+                        revs_done = self._revisions(cp)
+                        if revise.group(1):
+                            base = self._find_revision(revs_done, int(revise.group(1)))
+                            if not base:
+                                return (f"No version {revise.group(1)} to revise from. "
+                                        "Reply **revisions** to list them."
+                                        + self._footer(STATE_DONE, self.DONE_TEXT, smark))
+                            plan = base["plan"]
+                            why = f"revise (from v{base['n']}): {feedback[:48]}"
                         await status(f"✏️ {v.STRATEGIST_MODEL} reworking the plan…")
                         return await self._full_run(
                             session, status, sid, smark, brief,
                             roster=cp.get("roster", []), reports=cp.get("reports", {}),
-                            findings=f"### Founder feedback after delivery\n{revise.group(1).strip()}",
-                            docs=docs, prior_plan=plan, revisions=self._revisions(cp),
-                            why=f"revise: {revise.group(1).strip()[:60]}",
-                            doc_files=doc_files)
+                            findings=f"### Founder feedback after delivery\n{feedback}",
+                            docs=docs, prior_plan=plan, revisions=revs_done,
+                            why=why, doc_files=doc_files)
                     # checkpoint incomplete → fall through to advisor
 
                 if not new_v:
