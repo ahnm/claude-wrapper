@@ -311,9 +311,11 @@ class Handler(BaseHTTPRequestHandler):
                     for name, w in state["workers"].items()
                 })
             if self.path == "/sessions":
+                # 'pipe' matters: clients filter the list by which pipe owns the
+                # session, and omitting it made every venture invisible to them
                 return self._json(200, {
                     sid: {"name": s.get("name", ""), "phase": s.get("phase", ""),
-                          "job_id": s.get("job_id"),
+                          "pipe": s.get("pipe", ""), "job_id": s.get("job_id"),
                           "updated_seconds_ago": int(time.time() - s.get("updated_at", 0))}
                     for sid, s in state["sessions"].items()
                 })
