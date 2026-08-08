@@ -97,10 +97,12 @@ def deploy(path: Path, args, key: str, existing: list) -> bool:
     source = path.read_text(encoding="utf-8")
     meta = frontmatter(source)
     fid = args.id or re.sub(r"\W", "_", path.stem).lower()
-    name = meta.get("title") or path.stem
+    name = args.name or meta.get("title") or path.stem
 
     by_id = {f.get("id") for f in existing}
-    if fid not in by_id:
+    # An explicit --id is a deliberate target (a side-by-side test copy, say);
+    # never loosely remap it onto the live function.
+    if not args.id and fid not in by_id:
         # Installed by hand? OpenWebUI derives its own id from the title and
         # title-cases the name, so match loosely rather than duplicating the
         # function under a second id.
@@ -130,11 +132,19 @@ def deploy(path: Path, args, key: str, existing: list) -> bool:
     endpoint = (f"/api/v1/functions/id/{fid}/update" if exists
                 else "/api/v1/functions/create")
     status, body = call(args.url, key, endpoint, payload)
-    if status == 200:
-        print(f"  OK - {verb}d")
-        return True
-    print(f"  FAILED - HTTP {status}: {body}")
-    return False
+    if status != 200:
+        print(f"  FAILED - HTTP {status}: {body}")
+        return False
+    print(f"  OK - {verb}d")
+
+    active = isinstance(body, dict) and body.get("is_active")
+    if not active and args.activate:
+        status, _ = call(args.url, key, f"/api/v1/functions/id/{fid}/toggle", {})
+        print("  enabled" if status == 200 else f"  could not enable (HTTP {status})")
+    elif not active:
+        print("  note: function is disabled — pass --activate, or enable it in "
+              "Workspace -> Functions")
+    return True
 
 
 def main():
@@ -144,7 +154,13 @@ def main():
     ap.add_argument("--url", default=os.environ.get("OPENWEBUI_URL", DEFAULT_URL))
     ap.add_argument("--key", help="API key (prefer OPENWEBUI_API_KEY)")
     ap.add_argument("--key-file", help=f"file holding the key (default {DEFAULT_KEY_FILE})")
-    ap.add_argument("--id", help="function id; defaults to the filename stem")
+    ap.add_argument("--id", help="function id; defaults to the filename stem. An explicit "
+                                 "id is targeted exactly — use it for side-by-side test copies")
+    ap.add_argument("--name", help="display name; defaults to the docstring title")
+    ap.add_argument("--activate", action="store_true",
+                    help="enable the function after creating it (new ones start disabled)")
+    ap.add_argument("--delete", action="store_true",
+                    help="remove the function instead of deploying (needs --id)")
     ap.add_argument("--dry-run", action="store_true", help="report what would happen")
     args = ap.parse_args()
 
@@ -158,6 +174,22 @@ def main():
     key = read_key(args)
     print(f"OpenWebUI: {args.url}")
     existing = installed(args, key)
+
+    if args.delete:
+        if not args.id:
+            sys.exit("--delete needs an explicit --id, so it cannot remove the wrong one")
+        target = next((f for f in existing if f.get("id") == args.id), None)
+        if not target:
+            sys.exit(f"No function with id {args.id!r} — nothing to delete")
+        print(f"delete {args.id!r} ({target.get('name')!r})")
+        if args.dry_run:
+            sys.exit("DRY RUN - nothing sent")
+        req = urllib.request.Request(
+            args.url.rstrip("/") + f"/api/v1/functions/id/{args.id}/delete",
+            method="DELETE", headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            print("  OK - deleted" if r.status == 200 else f"  HTTP {r.status}")
+        sys.exit(0)
     print(f"{len(existing)} function(s) already installed")
     ok = all([deploy(p, args, key, existing) for p in paths])
     sys.exit(0 if ok else 1)
